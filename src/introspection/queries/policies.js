@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const POLICIES_QUERY = `
 SELECT pol.polname AS name,
        n.nspname AS schema,

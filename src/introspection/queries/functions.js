@@ -1,10 +1,14 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const FUNCTIONS_QUERY = `
 SELECT p.oid,
        n.nspname AS schema,
        p.proname AS name,
        pg_catalog.pg_get_function_identity_arguments(p.oid) AS argument_types,
        p.proargnames AS argument_names,
-       p.proargdefaults AS argument_defaults,
+       pg_catalog.pg_get_expr(p.proargdefaults, 0) AS argument_defaults,
        p.proargmodes AS argument_modes,
        pg_catalog.pg_get_function_result(p.oid) AS return_type,
        p.proretset AS return_set,
@@ -35,7 +39,7 @@ SELECT p.oid,
        pg_catalog.pg_get_userbyid(p.proowner) AS owner,
        p.proconfig AS configuration,
        p.proacl AS privileges,
-       p.prosupport::regproc::text AS support_function,
+       CASE WHEN p.prosupport != 0 THEN p.prosupport::regproc::text ELSE NULL END AS support_function,
        pg_catalog.obj_description(p.oid, 'pg_proc') AS comment,
        a.aggtransfn::text AS agg_sfunc,
        a.aggfinalfn::text AS agg_finalfunc,
@@ -51,7 +55,7 @@ SELECT p.oid,
        END AS agg_finalfunc_modify,
        a.aggserialfn::text AS agg_serialfunc,
        a.aggdeserialfn::text AS agg_deserialfunc,
-       a.aggsortop::regoper::text AS agg_sortop,
+       CASE WHEN a.aggsortop != 0 THEN a.aggsortop::regoper::text ELSE NULL END AS agg_sortop,
        CASE a.aggkind
          WHEN 'n' THEN false
          WHEN 'h' THEN true

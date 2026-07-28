@@ -1,12 +1,6 @@
 /**
- * @typedef {Object} ExecutionOptions
- * @property {boolean} [dryRun]
- * @property {boolean} [force]
- * @property {number} [statementTimeoutMs]
- * @property {number} [batchSize]
- * @property {number} [sleepMs]
- * @property {function(string, string):void} [onProgress]
- * @property {string} [resumeFrom]
+ * Schema Weaver Migration Engine - Type Definitions
+ * https://schemaweaver.vivekmind.com/
  */
 
 /**

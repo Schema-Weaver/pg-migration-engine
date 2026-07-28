@@ -1,6 +1,6 @@
 /**
- * @param {import('pg').Pool} pool
- * @returns {Promise<number>}
+ * Schema Weaver Migration Engine - Schema Introspection
+ * https://schemaweaver.vivekmind.com/
  */
 export async function detectPgVersion(pool) {
   const result = await pool.query("SELECT current_setting('server_version_num')::int AS version_num");

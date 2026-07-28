@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Migration Planner
+ * https://schemaweaver.vivekmind.com/
+ */
 export class StepSequencer {
   /**
    * @param {import('../types/changes.js').SchemaChange[]} changes
@@ -40,19 +44,32 @@ export class StepSequencer {
       }
     }
 
+    // Use indexed queue for O(1) operations instead of shift()
     const queue = [];
     for (const [id, degree] of inDegree) {
       if (degree === 0) queue.push(id);
     }
 
+    queue.sort();
+
     const sorted = [];
-    while (queue.length > 0) {
-      const current = queue.shift();
+    let queueHead = 0;
+    
+    while (queueHead < queue.length) {
+      const current = queue[queueHead++];
       sorted.push(stepMap.get(current));
 
+      const newZeroDegree = [];
       for (const neighbor of adj.get(current) || []) {
         inDegree.set(neighbor, inDegree.get(neighbor) - 1);
-        if (inDegree.get(neighbor) === 0) queue.push(neighbor);
+        if (inDegree.get(neighbor) === 0) newZeroDegree.push(neighbor);
+      }
+
+      newZeroDegree.sort();
+      
+      // Append new zero-degree nodes to queue (O(1))
+      for (const id of newZeroDegree) {
+        queue.push(id);
       }
     }
 

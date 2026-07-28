@@ -1,6 +1,6 @@
 /**
- * @param {import('../types/changes.js').SchemaChange} change
- * @returns {import('../types/risk.js').RiskFinding[]}
+ * Schema Weaver Migration Engine - Risk Engine
+ * https://schemaweaver.vivekmind.com/
  */
 export function checkDataLoss(change) {
   const findings = [];

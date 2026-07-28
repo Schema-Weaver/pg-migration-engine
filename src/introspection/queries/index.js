@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 export { querySchemas, queryTables, queryColumns, queryToastOptions } from './tables.js';
 export { queryConstraints } from './constraints.js';
 export { queryIndexes, queryIndexColumns } from './indexes.js';

@@ -1,4 +1,11 @@
-const EVENT_TRIGGERS_QUERY = `
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
+function buildEventTriggersQuery(version) {
+  const loginFilter = version >= 170000 ? '' : " AND e.evtevent != 'login'";
+  
+  return `
 SELECT
   e.oid,
   e.evtname AS name,
@@ -14,8 +21,10 @@ SELECT
   e.evttags AS tags,
   pg_catalog.obj_description(e.oid, 'pg_event_trigger') AS comment
 FROM pg_catalog.pg_event_trigger e
+WHERE 1=1${loginFilter}
 ORDER BY e.evtname
 `;
+}
 
 /**
  * @param {import('pg').Pool} pool
@@ -26,7 +35,8 @@ export async function queryEventTriggers(pool, version) {
   if (version < 90300) return [];
 
   try {
-    const result = await pool.query(EVENT_TRIGGERS_QUERY);
+    const query = buildEventTriggersQuery(version);
+    const result = await pool.query(query);
     
     return result.rows.map(row => ({
       name: row.name,

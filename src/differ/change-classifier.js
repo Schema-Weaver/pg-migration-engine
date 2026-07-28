@@ -1,6 +1,9 @@
 /**
- * Change classifier - separates Track 1 (structural) from Track 2 (behavioral).
+ * Schema Weaver Migration Engine - Schema Differ
+ * https://schemaweaver.vivekmind.com/
  */
+
+import { isDDLTransactionalInPG } from '../ddl-generator/pg-version.js';
 
 export class ChangeClassifier {
   /**
@@ -48,6 +51,11 @@ export class ChangeClassifier {
   getDDLStrategy(change) {
     const objType = change.objectType;
     const changeType = change.changeType;
+
+    // ADD_ENUM_VALUES is an ALTER operation, not a CREATE
+    if (changeType === 'ADD_ENUM_VALUES') {
+      return this.getAlterStrategy(change);
+    }
 
     // CREATE operations
     if (changeType === 'CREATE' || changeType.includes('ADD')) {
@@ -116,6 +124,7 @@ export class ChangeClassifier {
         if (change.property === 'isValidated') return 'VALIDATE_CONSTRAINT';
         return 'DROP_AND_CREATE';
       case 'type':
+        if (change.changeType === 'ADD_ENUM_VALUES') return 'ALTER_TYPE_ADD_VALUE';
         if (change.property === 'enumValues' && change.addedValues) return 'ALTER_TYPE_ADD_VALUE';
         return 'DROP_AND_CREATE';
       default:
@@ -172,10 +181,12 @@ export class ChangeClassifier {
     const nonTransactionalStrategies = [
       'CREATE_INDEX_CONCURRENTLY',
       'DROP_INDEX_CONCURRENTLY',
+      'REINDEX_CONCURRENTLY',
       'VACUUM_FULL',
       'CLUSTER',
       'CREATE_DATABASE',
       'DROP_DATABASE',
+      'DETACH_PARTITION_CONCURRENTLY',
     ];
 
     if (nonTransactionalStrategies.includes(change.ddlStrategy)) {
@@ -185,6 +196,12 @@ export class ChangeClassifier {
     // CONCURRENTLY flag
     if (change.isConcurrent || change.before?.isConcurrent) {
       return false;
+    }
+
+    // ALTER TYPE ADD VALUE — version-dependent (PG12+ allows in TX)
+    if (change.ddlStrategy === 'ALTER_TYPE_ADD_VALUE') {
+      const pgVersion = change.pgVersionNum || 140000;
+      return isDDLTransactionalInPG('ALTER_TYPE_ADD_VALUE', pgVersion);
     }
 
     return true;

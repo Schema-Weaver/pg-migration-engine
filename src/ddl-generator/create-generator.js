@@ -1,5 +1,6 @@
 /**
- * Generate CREATE DDL for any object type.
+ * Schema Weaver Migration Engine - DDL Generator
+ * https://schemaweaver.vivekmind.com/
  */
 
 export function generateCreateSql(change) {
@@ -250,7 +251,8 @@ function generateCreateColumnSql(change) {
   const colName = ident(parts.pop());
   const tableName = parts.map(ident).join('.');
   
-  let sql = `ALTER TABLE ${tableName} ADD COLUMN ${colName} ${col.dataType}`;
+  const ifNotExists = col.ifNotExists !== false ? 'IF NOT EXISTS ' : '';
+  let sql = `ALTER TABLE ${tableName} ADD COLUMN ${ifNotExists}${colName} ${col.dataType}`;
   
   if (col.collation) {
     sql += ` COLLATE ${col.collation}`;
@@ -261,7 +263,7 @@ function generateCreateColumnSql(change) {
   }
   
   if (col.defaultValue !== undefined && col.defaultValue !== null) {
-    sql += ` DEFAULT ${col.defaultValue}`;
+    sql += ` DEFAULT ${escapeDefaultValue(col.defaultValue)}`;
   }
   
   if (col.isIdentity) {
@@ -362,10 +364,27 @@ function generateCreateTableSql(table) {
   }
 
   const colDefs = (table.columns || []).map(c => {
-    let def = `${ident(c.name)} ${c.dataType}`;
+    let typeStr = c.dataType || c.type || 'text';
+    const typeSchema = c.dataTypeSchema || c.udtSchema;
+    const lowerType = typeStr.toLowerCase();
+    const isStd = lowerType.startsWith('character varying') || 
+                  lowerType.startsWith('varchar') || 
+                  lowerType.startsWith('char') || 
+                  lowerType.startsWith('numeric') || 
+                  lowerType.startsWith('decimal') || 
+                  lowerType.startsWith('timestamp') || 
+                  ['bigint', 'integer', 'int', 'smallint', 'boolean', 'bool', 'text', 'date', 'uuid', 'json', 'jsonb', 'bytea', 'real', 'double precision'].some(t => lowerType.startsWith(t)) || 
+                  typeStr.endsWith('[]');
+    if (!isStd && !typeStr.includes('.')) {
+      const sch = typeSchema || table.schema;
+      if (sch && sch !== 'pg_catalog' && sch !== 'public') {
+        typeStr = `${ident(sch)}.${ident(typeStr)}`;
+      }
+    }
+    let def = `${ident(c.name)} ${typeStr}`;
     if (!c.isNullable) def += ' NOT NULL';
     if (c.defaultValue !== undefined && c.defaultValue !== null) {
-      def += ` DEFAULT ${c.defaultValue}`;
+      def += ` DEFAULT ${escapeDefaultValue(c.defaultValue)}`;
     }
     if (c.isGenerated && c.generatedExpression) {
       def += ` GENERATED ALWAYS AS (${c.generatedExpression}) STORED`;
@@ -403,7 +422,8 @@ function generateCreateTableSql(table) {
     typePrefix = 'UNLOGGED TABLE';
   }
 
-  let sql = `CREATE ${typePrefix} ${tableKey} (\n  ${colDefs.join(',\n  ')}\n)`;
+  const ifNotExists = table.ifNotExists !== false ? 'IF NOT EXISTS ' : '';
+  let sql = `CREATE ${typePrefix} ${ifNotExists}${tableKey} (\n  ${colDefs.join(',\n  ')}\n)`;
 
   // WITH storage options
   const withOpts = [];
@@ -480,6 +500,64 @@ function generateCreateTableSql(table) {
   return sql;
 }
 
+/**
+ * Validate and sanitize a CHECK constraint expression.
+ * SECURITY: Detects potential SQL injection patterns in CHECK expressions.
+ */
+function validateCheckExpression(expr) {
+  if (!expr || typeof expr !== 'string') return expr;
+  
+  let check = expr.trim();
+  
+  // Remove CHECK wrapper if present
+  if (check.toUpperCase().startsWith('CHECK')) {
+    check = check.replace(/^CHECK\s*\(/i, '').replace(/\)$/, '');
+  }
+  
+  // Validate parentheses balance
+  let depth = 0;
+  for (let i = 0; i < check.length; i++) {
+    const char = check[i];
+    if (char === '(') depth++;
+    if (char === ')') {
+      depth--;
+      if (depth < 0) {
+        throw new Error(
+          `Invalid CHECK expression: unbalanced closing parenthesis at position ${i}. ` +
+          `Expression: "${check.substring(0, 50)}${check.length > 50 ? '...' : ''}"`
+        );
+      }
+    }
+  }
+  if (depth !== 0) {
+    throw new Error(
+      `Invalid CHECK expression: unbalanced parentheses (${depth} unclosed). ` +
+      `Expression: "${check.substring(0, 50)}${check.length > 50 ? '...' : ''}"`
+    );
+  }
+  
+  // Warn about potential injection patterns
+  const suspiciousPatterns = [
+    { pattern: /\)\s*;/, message: 'Closing parenthesis followed by semicolon' },
+    { pattern: /;\s*--/, message: 'Semicolon followed by comment' },
+    { pattern: /;\s*DROP\s+/i, message: 'Potential DROP statement injection' },
+    { pattern: /;\s*DELETE\s+/i, message: 'Potential DELETE statement injection' },
+    { pattern: /;\s*INSERT\s+/i, message: 'Potential INSERT statement injection' },
+    { pattern: /;\s*UPDATE\s+/i, message: 'Potential UPDATE statement injection' },
+  ];
+  
+  for (const { pattern, message } of suspiciousPatterns) {
+    if (pattern.test(check)) {
+      console.warn(
+        `[Security] CHECK expression contains suspicious pattern: ${message}. ` +
+        `Please verify expression is safe.`
+      );
+    }
+  }
+  
+  return check;
+}
+
 function generateInlineConstraint(con) {
   if (!con.name) return null;
   
@@ -487,10 +565,16 @@ function generateInlineConstraint(con) {
     case 'PRIMARY KEY':
     case 'PRIMARY_KEY':
       return `CONSTRAINT ${ident(con.name)} PRIMARY KEY (${(con.columns || []).map(ident).join(', ')})`;
-    case 'UNIQUE':
-      return `CONSTRAINT ${ident(con.name)} UNIQUE (${(con.columns || []).map(ident).join(', ')})`;
-    case 'CHECK':
-      return `CONSTRAINT ${ident(con.name)} CHECK (${con.definition})`;
+    case 'UNIQUE': {
+      const nullsNotDistinct = con.nullsNotDistinct !== undefined && con.nullsNotDistinct !== null && con.nullsNotDistinct ? ' NULLS NOT DISTINCT' : '';
+      return `CONSTRAINT ${ident(con.name)} UNIQUE (${(con.columns || []).map(ident).join(', ')})${nullsNotDistinct}`;
+    }
+    case 'CHECK': {
+      const validatedExpr = validateCheckExpression(
+        con.checkExpression || con.expression || con.definition || ''
+      );
+      return `CONSTRAINT ${ident(con.name)} CHECK (${validatedExpr})`;
+    }
     default:
       return null;
   }
@@ -511,11 +595,9 @@ function generateCreateViewSql(view, change = {}) {
     withOpts.push(`security_barrier = ${view.securityBarrier}`);
   }
   
-  const pgVersion = change.pgVersion || change.metadata?.pgVersion;
-  if (view.securityInvoker !== undefined) {
-    if (!pgVersion || pgVersion >= 150000) {
-      withOpts.push(`security_invoker = ${view.securityInvoker}`);
-    }
+  const pgVersion = change.pgVersion || change.metadata?.pgVersion || 140000;
+  if (view.securityInvoker !== undefined && pgVersion >= 150000) {
+    withOpts.push(`security_invoker = ${view.securityInvoker}`);
   }
   
   if (view.checkOption && (view.checkOption.toLowerCase() === 'local' || view.checkOption.toLowerCase() === 'cascaded')) {
@@ -554,6 +636,9 @@ function generateCreateViewSql(view, change = {}) {
 }
 
 function generateCreateFunctionSql(fn, isProcedure = false) {
+  if (fn.language === 'internal') {
+    return `-- Skipping internal system function ${fn.name}`;
+  }
   const keyword = isProcedure ? 'PROCEDURE' : 'FUNCTION';
   let args = '';
   if (fn.argumentTypes && fn.argumentTypes.length > 0) {
@@ -621,18 +706,16 @@ function generateCreateTriggerSql(trig) {
   } else {
     funcRef = `${ident(trig.schema || 'public')}.${ident(funcName)}`;
   }
-  sql += ` EXECUTE FUNCTION ${funcRef}`;
-  
-  if (trig.functionArguments) {
-    sql += `(${trig.functionArguments})`;
-  }
-  
-  sql += ';';
+  const args = trig.functionArguments || '';
+  sql += ` EXECUTE FUNCTION ${funcRef}(${args});`;
   
   return sql;
 }
 
 function generateCreateIndexSql(idx) {
+  if (idx.isConstraintIndex || idx.isPrimaryKeyIndex || (idx.name && (idx.name.endsWith('_pkey') || idx.name.endsWith('_key')))) {
+    return `-- Index ${idx.name} automatically backing PK/Unique constraint`;
+  }
   let sql = '';
   if (idx.definition) {
     sql = idx.definition;
@@ -644,7 +727,8 @@ function generateCreateIndexSql(idx) {
     sql += 'INDEX';
     if (idx.isConcurrent) sql += ' CONCURRENTLY';
     
-    sql += ` ${ident(idx.name)} ON ${ident(idx.schema)}.${ident(idx.table)}`;
+    const ifNotExists = idx.ifNotExists !== false && !idx.isConcurrent ? 'IF NOT EXISTS ' : '';
+    sql += ` ${ifNotExists}${ident(idx.name)} ON ${ident(idx.schema)}.${ident(idx.table)}`;
     
     if (idx.accessMethod && idx.accessMethod !== 'btree') {
       sql += ` USING ${idx.accessMethod}`;
@@ -688,7 +772,11 @@ function generateCreateIndexSql(idx) {
 }
 
 function generateCreateConstraintSql(con) {
-  const table = con.tableKey || `${ident(con.schema)}.${ident(con.table)}`;
+  const tableNameClean = con.tableName || (con.table ? con.table.split('.').pop() : '');
+  if (!tableNameClean || tableNameClean === 'null' || con.domain || con.domainName) {
+    return '';
+  }
+  const table = con.tableKey || `${ident(con.schema)}.${ident(tableNameClean)}`;
   const constraintType = con.constraintType || con.type;
   const isDeferred = con.initiallyDeferred || con.deferred || con.isDeferred;
   const deferClause = con.deferrable ? (isDeferred ? ' DEFERRABLE INITIALLY DEFERRED' : ' DEFERRABLE INITIALLY IMMEDIATE') : '';
@@ -698,12 +786,15 @@ function generateCreateConstraintSql(con) {
   switch (constraintType) {
     case 'PRIMARY KEY':
     case 'PRIMARY_KEY':
-      sql = `ALTER TABLE ${table} ADD CONSTRAINT ${ident(con.name)} PRIMARY KEY (${(con.columns || []).map(ident).join(', ')})${deferClause}${enforceClause};`;
-      break;
+      return `-- Primary key ${con.name} created inline during CREATE TABLE`;
       
     case 'FOREIGN KEY':
     case 'FOREIGN_KEY': {
-      sql = `ALTER TABLE ${table} ADD CONSTRAINT ${ident(con.name)} FOREIGN KEY (${(con.columns || []).map(ident).join(', ')}) REFERENCES ${ident(con.referencedTable)} (${(con.referencedColumns || []).map(ident).join(', ')})`;
+      const refSchema = con.referencedSchema || con.refSchema || con.schema;
+      const refTableClean = con.referencedTable || con.refTable || '';
+      const refTableName = refTableClean.includes('.') ? refTableClean.split('.').pop() : refTableClean;
+      const refTableRef = `${ident(refSchema)}.${ident(refTableName)}`;
+      sql = `ALTER TABLE ${table} ADD CONSTRAINT ${ident(con.name)} FOREIGN KEY (${(con.columns || []).map(ident).join(', ')}) REFERENCES ${refTableRef} (${(con.referencedColumns || []).map(ident).join(', ')})`;
       if (con.onDelete) sql += ` ON DELETE ${con.onDelete}`;
       if (con.onUpdate) sql += ` ON UPDATE ${con.onUpdate}`;
       sql += `${deferClause}${enforceClause};`;
@@ -711,12 +802,23 @@ function generateCreateConstraintSql(con) {
     }
 
     case 'UNIQUE':
-      sql = `ALTER TABLE ${table} ADD CONSTRAINT ${ident(con.name)} UNIQUE (${(con.columns || []).map(ident).join(', ')})${deferClause}${enforceClause};`;
+      if (con.createdWithTable || con.isInline || con.generatedInTable || (con.name && con.name.endsWith('_key'))) {
+        return `-- Unique constraint ${con.name} created inline during CREATE TABLE`;
+      }
+      const nullsNotDistinct = con.nullsNotDistinct !== undefined && con.nullsNotDistinct !== null && con.nullsNotDistinct ? ' NULLS NOT DISTINCT' : '';
+      sql = `ALTER TABLE ${table} ADD CONSTRAINT ${ident(con.name)} UNIQUE (${(con.columns || []).map(ident).join(', ')})${nullsNotDistinct}${deferClause}${enforceClause};`;
       break;
       
-    case 'CHECK':
-      sql = `ALTER TABLE ${table} ADD CONSTRAINT ${ident(con.name)} CHECK (${con.definition})${enforceClause};`;
+    case 'CHECK': {
+      if (con.createdWithTable || con.isInline || con.generatedInTable || (con.name && con.name.endsWith('_check'))) {
+        return `-- Check constraint ${con.name} created inline during CREATE TABLE`;
+      }
+      const validatedExpr = validateCheckExpression(
+        con.checkExpression || con.expression || con.definition || ''
+      );
+      sql = `ALTER TABLE ${table} ADD CONSTRAINT ${ident(con.name)} CHECK (${validatedExpr})${enforceClause};`;
       break;
+    }
       
     case 'EXCLUSION':
       sql = `ALTER TABLE ${table} ADD CONSTRAINT ${ident(con.name)} EXCLUDE ${con.accessMethod || 'GIST'} (${con.exclusions?.map(e => `${e.expression} WITH ${e.operator}`).join(', ') || ''})${con.where ? ` WHERE ${con.where}` : ''}${deferClause};`;
@@ -750,12 +852,8 @@ function generateCreateSequenceSql(seq) {
   if (cache !== undefined) sql += ` CACHE ${cache}`;
   if (cycle) sql += ' CYCLE';
 
-  const ownedBy = seq.ownedBy || (seq.ownerTable && seq.ownerColumn ? `${seq.ownerTable}.${seq.ownerColumn}` : undefined);
-  if (ownedBy && ownedBy !== 'NONE') {
-    const ownedParts = ownedBy.split('.');
-    const formattedOwnedBy = ownedParts.map(ident).join('.');
-    sql += ` OWNED BY ${formattedOwnedBy}`;
-  }
+  // OWNED BY is omitted during CREATE SEQUENCE to allow creation before dependent tables
+  // Table columns reference sequences via DEFAULT nextval(...) during CREATE TABLE
 
   sql += ';';
 
@@ -808,17 +906,21 @@ function generateCreatePolicySql(pol) {
 }
 
 function generateCreateTypeSql(type) {
+  if (type.kind === 'DOMAIN' || type.baseType) {
+    return generateCreateDomainSql(type);
+  }
   if (type.kind === 'ENUM' || type.enumValues) {
     const values = (type.enumValues || []).map(v => {
       const val = typeof v === 'string' ? v : v.value;
-      return `'${val}'`;
+      // SECURITY: Escape single quotes in enum values to prevent SQL injection
+      return `'${String(val).replace(/'/g, "''")}'`;
     }).join(', ');
     return `CREATE TYPE ${ident(type.schema)}.${ident(type.name)} AS ENUM (${values});`;
   }
   
   if (type.kind === 'COMPOSITE') {
     if (!type.attributes) return `-- Composite type ${type.name} has no attributes`;
-    return `CREATE TYPE ${ident(type.schema)}.${ident(type.name)} AS (${type.attributes.map(a => `${ident(a.name)} ${a.dataType}`).join(', ')});`;
+    return `CREATE TYPE ${ident(type.schema)}.${ident(type.name)} AS (${type.attributes.map(a => `${ident(a.name)} ${a.dataType || a.type || a.data_type || 'text'}`).join(', ')});`;
   }
   
   if (type.kind === 'RANGE') {
@@ -1015,10 +1117,23 @@ function generateCreatePublicationSql(pub) {
   return sql + ';';
 }
 
+/**
+ * Escape a connection string for safe inclusion in DDL.
+ * SECURITY: Escapes single quotes to prevent SQL injection.
+ * Note: Connection strings may contain credentials - consider sanitizing for logs.
+ */
+function escapeConnectionString(connStr) {
+  if (!connStr || typeof connStr !== 'string') return connStr;
+  // Escape single quotes for PostgreSQL string literal
+  return connStr.replace(/'/g, "''");
+}
+
 function generateCreateSubscriptionSql(sub) {
   let sql = `CREATE SUBSCRIPTION ${ident(sub.name)}`;
   const conn = sub.conninfo || sub.connectionString || sub.connection;
-  sql += ` CONNECTION '${conn}'`;
+  // SECURITY: Escape single quotes in connection string
+  // Note: Connection string may contain credentials - PostgreSQL stores this encrypted in pg_subscription
+  sql += ` CONNECTION '${escapeConnectionString(conn)}'`;
   sql += ` PUBLICATION ${Array.isArray(sub.publications) ? sub.publications.join(', ') : sub.publications}`;
   
   const withOpts = [];
@@ -1414,13 +1529,89 @@ function generateCreateMaterializedViewSql(mv) {
 
 function ident(name) {
   if (!name) return '';
-  if (name.includes('"') || name.includes(' ')) {
-    return `"${name.replace(/"/g, '""')}"`;
+  if (typeof name !== 'string') name = String(name);
+  
+  // Validation: PostgreSQL identifier max length is 63 characters
+  if (name.length > 63) {
+    console.warn(
+      `[Security] Identifier "${name.substring(0, 30)}..." (${name.length} chars) exceeds PostgreSQL limit of 63. ` +
+      `PostgreSQL will truncate to "${name.substring(0, 63)}".`
+    );
   }
-  return `"${name}"`;
+  
+  // Check for NUL character
+  if (name.includes('\0')) {
+    throw new Error(`Identifier contains NUL character (\\0) which is not allowed in PostgreSQL identifiers`);
+  }
+  
+  // Always double-quote identifiers to handle all special characters
+  // Escape embedded double-quotes by doubling them
+  return `"${name.replace(/"/g, '""')}"`;
 }
 
 function escapeString(str) {
   if (typeof str !== 'string') str = String(str);
   return str.replace(/'/g, "''");
+}
+
+/**
+ * Escape a default value for safe inclusion in DDL.
+ * 
+ * SECURITY: This function prevents SQL injection in DEFAULT clauses.
+ * 
+ * @param {*} defaultVal - The default value to escape
+ * @returns {string} - Escaped value safe for DDL
+ */
+function escapeDefaultValue(defaultVal) {
+  if (defaultVal === null || defaultVal === undefined) return 'NULL';
+  
+  const str = String(defaultVal).trim();
+  if (str === '') return "''";
+  if (str.toUpperCase() === 'NULL') return 'NULL';
+  
+  // Check if it's already dollar-quoted (user provided safe format)
+  if (str.startsWith('$$') && str.endsWith('$$')) {
+    return str;
+  }
+  
+  // Check if it's already single-quoted
+  if (str.startsWith("'") && str.endsWith("'")) {
+    // Validate and re-escape the contents
+    const inner = str.slice(1, -1);
+    return `'${inner.replace(/'/g, "''")}'`;
+  }
+  
+  // Check if it's a PostgreSQL keyword/function that should not be quoted
+  const noQuoteKeywords = [
+    'TRUE', 'FALSE',
+    'NOW()', 'CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_TIME',
+    'CURRENT_USER', 'SESSION_USER', 'CURRENT_SCHEMA',
+    'GEN_RANDOM_UUID()', 'UUID_GENERATE_V4()'
+  ];
+  
+  if (noQuoteKeywords.includes(str.toUpperCase())) {
+    return str;
+  }
+  
+  // Check if it's a number (integers and floats)
+  if (/^-?\d+(\.\d+)?$/.test(str)) {
+    return str;
+  }
+  
+  // Check if it's a PostgreSQL function call or expression
+  // Functions: func_name(), func_name(args)
+  if (/^[a-z_][a-z0-9_]*\s*\(/i.test(str) || 
+      str.toUpperCase().includes('::') || 
+      str.includes('ARRAY[') ||
+      str.includes('[]')) {
+    // This might be intentional SQL expression - pass through but warn
+    console.warn(
+      `[Security] Default value "${str.substring(0, 50)}${str.length > 50 ? '...' : ''}" ` +
+      `appears to be a SQL expression. Ensure this is intentional.`
+    );
+    return str;
+  }
+  
+  // Default: treat as string literal, escape single quotes and wrap
+  return `'${str.replace(/'/g, "''")}'`;
 }

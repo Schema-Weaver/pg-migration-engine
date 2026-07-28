@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const VIEWS_QUERY = `
 SELECT c.relname AS name,
        n.nspname AS schema,

@@ -1,6 +1,6 @@
 /**
- * Dependency resolver for ordering migration operations.
- * Builds dependency graph and performs topological sort.
+ * Schema Weaver Migration Engine - Schema Differ
+ * https://schemaweaver.vivekmind.com/
  */
 
 export class DependencyResolver {
@@ -333,29 +333,32 @@ export class DependencyResolver {
 
   sortQueueByPriority(queue, changes) {
     const priority = this.getObjectTypePriority();
+    const changeMap = new Map(changes.map(c => [c.id, c]));
 
     queue.sort((a, b) => {
-      const changeA = changes.find(c => c.id === a);
-      const changeB = changes.find(c => c.id === b);
+      const changeA = changeMap.get(a);
+      const changeB = changeMap.get(b);
 
       const pA = priority[changeA?.objectType] || 99;
       const pB = priority[changeB?.objectType] || 99;
 
-      return pA - pB;
+      if (pA !== pB) return pA - pB;
+      return (a || '').localeCompare(b || '');
     });
   }
 
   insertByPriority(queue, id, changes) {
     const priority = this.getObjectTypePriority();
-    const change = changes.find(c => c.id === id);
+    const changeMap = new Map(changes.map(c => [c.id, c]));
+    const change = changeMap.get(id);
     const p = priority[change?.objectType] || 99;
 
     let inserted = false;
     for (let i = 0; i < queue.length; i++) {
-      const qChange = changes.find(c => c.id === queue[i]);
+      const qChange = changeMap.get(queue[i]);
       const qP = priority[qChange?.objectType] || 99;
 
-      if (p < qP) {
+      if (p < qP || (p === qP && (id || '').localeCompare(queue[i] || '') < 0)) {
         queue.splice(i, 0, id);
         inserted = true;
         break;
@@ -438,11 +441,10 @@ export class DependencyResolver {
     const changeType = change.changeType;
 
     if (type === 'extension') return 3;
-    if (type === 'type' && changeType === 'CREATE') return 4;
+    if ((type === 'type' || type === 'domain') && changeType === 'CREATE') return 4;
     if (type === 'schema') return 5;
+    if (type === 'sequence') return 5;
     if (type === 'table' && changeType === 'CREATE') return 6;
-    if (type === 'column' && changeType.includes('ADD')) return 7;
-    if (type === 'sequence') return 8;
     if (type === 'index' && changeType === 'CREATE' && !change.isConcurrent) return 9;
     if (type === 'constraint' && change.constraintType !== 'FOREIGN_KEY') return 10;
     if (change.property === 'dataType' && change.castRequired) return 11;

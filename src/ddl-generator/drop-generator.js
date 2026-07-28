@@ -1,5 +1,6 @@
 /**
- * Generate DROP DDL for any object type.
+ * Schema Weaver Migration Engine - DDL Generator
+ * https://schemaweaver.vivekmind.com/
  */
 
 export function generateDropSql(change) {
@@ -13,7 +14,10 @@ export function generateDropSql(change) {
       return `DROP SCHEMA IF EXISTS ${ident(obj?.name || objectKey)} CASCADE;`;
 
     case 'table':
-      return `DROP TABLE IF EXISTS ${objectKey} CASCADE;`;
+      const tableParts = objectKey.split('.');
+      const tableSchema = tableParts.length > 1 ? tableParts[0] : 'public';
+      const tableName = tableParts.length > 1 ? tableParts.slice(1).join('.') : tableParts[0];
+      return `DROP TABLE IF EXISTS ${ident(tableSchema)}.${ident(tableName)} CASCADE;`;
 
     case 'view':
       return `DROP VIEW IF EXISTS ${objectKey} CASCADE;`;

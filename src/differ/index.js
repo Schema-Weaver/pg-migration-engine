@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Differ
+ * https://schemaweaver.vivekmind.com/
+ */
 export {
   SchemaDiffer,
   ObjectMatcher,

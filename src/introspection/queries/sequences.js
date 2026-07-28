@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const SEQUENCES_QUERY = `
 SELECT s.relname AS name,
        n.nspname AS schema,
@@ -11,7 +15,7 @@ SELECT s.relname AS name,
        seq.seqcycle AS cycle,
        CASE
          WHEN d.refobjid IS NOT NULL THEN
-           d.refobjid::regclass::text || '.' || a.attname
+            d.refobjid::regclass::text || '.'::text || a.attname
          ELSE NULL
        END AS owned_by,
        CASE WHEN s.reltablespace != 0 THEN (SELECT spcname FROM pg_catalog.pg_tablespace WHERE oid = s.reltablespace) ELSE NULL END AS tablespace,
@@ -20,7 +24,7 @@ SELECT s.relname AS name,
 FROM pg_catalog.pg_sequence seq
 JOIN pg_catalog.pg_class s ON s.oid = seq.seqrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = s.relnamespace
-LEFT JOIN pg_catalog.pg_depend d ON d.objid = s.oid AND d.deptype = 'a' AND d.classid = 'pg_class'::regclass
+LEFT JOIN pg_catalog.pg_depend d ON d.objid = s.oid AND d.deptype IN ('a', 'i') AND d.classid = 'pg_class'::regclass
 LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
   AND n.nspname NOT LIKE 'pg_temp_%'

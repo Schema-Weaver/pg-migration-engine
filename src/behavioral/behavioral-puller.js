@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Behavioral DDL
+ * https://schemaweaver.vivekmind.com/
+ */
 export class BehavioralPuller {
   /** @param {import('pg').Pool} pool */
   constructor(pool) {

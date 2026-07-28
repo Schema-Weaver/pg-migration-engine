@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const ENUMS_QUERY = `
 SELECT t.typname AS name,
        n.nspname AS schema,
@@ -69,7 +73,7 @@ WHERE t.typtype = 'd'
 ORDER BY n.nspname, t.typname
 `;
 
-const RANGES_QUERY = `
+const RANGES_QUERY_PG19 = `
 SELECT t.typname AS name,
        n.nspname AS schema,
        t.typowner::regrole::text AS owner,
@@ -81,7 +85,12 @@ SELECT t.typname AS name,
        CASE WHEN r.rngsubdiff != 0 THEN r.rngsubdiff::regproc::text ELSE NULL END AS subtype_diff,
        CASE WHEN r.rngcanonical != 0 THEN r.rngcanonical::regproc::text ELSE NULL END AS canonical_function,
        pg_catalog.obj_description(t.oid, 'pg_type') AS comment,
-       t.typacl AS privileges
+       t.typacl AS privileges,
+       r.rngconstruct2 AS construct2,
+       r.rngconstruct3 AS construct3,
+       r.rngmltconstruct0 AS mltconstruct0,
+       r.rngmltconstruct1 AS mltconstruct1,
+       r.rngmltconstruct2 AS mltconstruct2
 FROM pg_catalog.pg_range r
 JOIN pg_catalog.pg_type t ON t.oid = r.rngtypid
 JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
@@ -91,16 +100,48 @@ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
 ORDER BY n.nspname, t.typname
 `;
 
+const RANGES_QUERY_PRE_PG19 = `
+SELECT t.typname AS name,
+       n.nspname AS schema,
+       t.typowner::regrole::text AS owner,
+       format_type(r.rngsubtype, NULL) AS subtype,
+       (SELECT n2.nspname FROM pg_type st JOIN pg_namespace n2 ON n2.oid = st.typnamespace WHERE st.oid = r.rngsubtype) AS subtype_schema,
+       r.rngmultitypid::regtype AS multirange_type,
+       CASE WHEN r.rngcollation != 0 THEN r.rngcollation::regcollation::text ELSE NULL END AS collation,
+       opc.opcname AS subtype_opclass,
+       CASE WHEN r.rngsubdiff != 0 THEN r.rngsubdiff::regproc::text ELSE NULL END AS subtype_diff,
+       CASE WHEN r.rngcanonical != 0 THEN r.rngcanonical::regproc::text ELSE NULL END AS canonical_function,
+       pg_catalog.obj_description(t.oid, 'pg_type') AS comment,
+       t.typacl AS privileges,
+       NULL::text AS construct2,
+       NULL::text AS construct3,
+       NULL::text AS mltconstruct0,
+       NULL::text AS mltconstruct1,
+       NULL::text AS mltconstruct2
+FROM pg_catalog.pg_range r
+JOIN pg_catalog.pg_type t ON t.oid = r.rngtypid
+JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+LEFT JOIN pg_catalog.pg_opclass opc ON opc.oid = r.rngsubopc
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_temp_%'
+ORDER BY n.nspname, t.typname
+`;
+
+const PG_VERSION_19 = 190000;
+
 /**
  * @param {import('pg').Pool} pool
+ * @param {number} [version]
  * @returns {Promise<{enums:Array,composites:Array,domains:Array,ranges:Array}>}
  */
-export async function queryTypes(pool) {
+export async function queryTypes(pool, version = 150000) {
+  const rangesQuery = version >= PG_VERSION_19 ? RANGES_QUERY_PG19 : RANGES_QUERY_PRE_PG19;
+  
   const [enums, composites, domains, ranges] = await Promise.all([
     pool.query(ENUMS_QUERY).then(r => r.rows),
     pool.query(COMPOSITES_QUERY).then(r => r.rows),
     pool.query(DOMAINS_QUERY).then(r => r.rows),
-    pool.query(RANGES_QUERY).then(r => r.rows),
+    pool.query(rangesQuery).then(r => r.rows),
   ]);
   return { enums, composites, domains, ranges };
 }

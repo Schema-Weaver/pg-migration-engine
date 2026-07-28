@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Migration Planner
+ * https://schemaweaver.vivekmind.com/
+ */
 export class DryRun {
   /**
    * @param {import('pg').Pool} pool

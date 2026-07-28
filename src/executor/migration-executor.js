@@ -1,14 +1,21 @@
+/**
+ * Schema Weaver Migration Engine - Migration Executor
+ * https://schemaweaver.vivekmind.com/
+ */
 import { TransactionManager } from './transaction-manager.js';
 import { LockManager } from './lock-manager.js';
 import { ProgressTracker } from './progress-tracker.js';
 import { DriftDetector } from './drift-detector.js';
+import { CrashRecovery } from '../recovery/crash-recovery.js';
 import { splitSqlStatements, sanitizeSavepointName } from './sql-splitter.js';
+import { isDDLTransactionalInPG } from '../ddl-generator/pg-version.js';
 import {
   ExecutionError,
   PreCheckFailedError,
   MigrationConflictError,
   VersionIncompatibilityError,
   DriftDetectedError,
+  LockAcquisitionError,
 } from '../errors.js';
 import {
   MIGRATION_STATUS,
@@ -17,23 +24,64 @@ import {
 } from '../constants.js';
 
 /**
+ * Sanitize a string to remove potential credentials.
+ * SECURITY: Prevents credential exposure in logs and error messages.
+ */
+function sanitizeCredentials(str) {
+  if (!str || typeof str !== 'string') return str;
+  
+  let result = str;
+  
+  // URI format: postgresql://user:password@host:port/database
+  result = result.replace(
+    /(postgresql?:\/\/[^:]+:)([^@]+)(@)/gi,
+    '$1***$3'
+  );
+  
+  // Key-value format: password=secret
+  result = result.replace(
+    /(\bpassword\s*=\s*)([^\s,;]+)/gi,
+    '$1***'
+  );
+  
+  // Also handle pwd, passwd variations
+  result = result.replace(
+    /(\bpwd\s*=\s*)([^\s,;]+)/gi,
+    '$1***'
+  );
+  
+  // Handle pass= variations
+  result = result.replace(
+    /(\bpass\s*=\s*)([^\s,;]+)/gi,
+    '$1***'
+  );
+  
+  return result;
+}
+
+/**
  * Extract structured error information from a PostgreSQL error.
  * The pg driver puts all PG error fields on the Error object.
+ * SECURITY: Sanitizes credential-like patterns from error messages.
  */
 export function extractPgError(error) {
+  // Sanitize message to prevent credential exposure
+  const rawMessage = error.message || 'Unknown error';
+  const message = sanitizeCredentials(rawMessage);
+  
   return {
-    message: error.message || 'Unknown error',
+    message,
     code: error.code || 'UNKNOWN',
     severity: error.severity || 'ERROR',
-    detail: error.detail || null,
-    hint: error.hint || null,
+    detail: error.detail ? sanitizeCredentials(error.detail) : null,
+    hint: error.hint ? sanitizeCredentials(error.hint) : null,
     schema: error.schema || null,
     table: error.table || null,
     column: error.column || null,
     datatype: error.datatype || null,
     constraint: error.constraint || null,
     position: error.position || null,
-    where: error.where || null,
+    where: error.where ? sanitizeCredentials(error.where) : null,
     isPgError: !!error.code && /^[0-9A-Z]{5}$/.test(error.code),
   };
 }
@@ -128,26 +176,44 @@ export function isNonTransactionalSQL(sql, step = {}) {
 
   if (!sql || typeof sql !== 'string') return false;
 
+  // Check via centralized DDL type registry if step has ddlStrategy
+  if (step.ddlStrategy && isDDLTransactionalInPG(step.ddlStrategy, step.pgVersionNum) === false) {
+    return true;
+  }
+
   const normalizedSql = sql.trim().toUpperCase();
 
+  // CONCURRENTLY index operations — never transactional
   if (/\b(CREATE|DROP|REINDEX)\s+INDEX\s+CONCURRENTLY\b/i.test(sql)) {
     return true;
   }
 
+  // ALTER TYPE ... ADD VALUE — transactional since PG12 (standalone)
   if (/\bALTER\s+TYPE\s+.*\bADD\s+VALUE\b/i.test(sql)) {
-    if (step.pgVersion && parseFloat(step.pgVersion) >= 12) {
-      return false;
-    }
+    const pgVer = step.pgVersionNum ||
+      (step.pgVersion ? parseFloat(step.pgVersion) * 10000 : 140000);
+    return !isDDLTransactionalInPG('ALTER_TYPE_ADD_VALUE', pgVer);
+  }
+
+  // DETACH PARTITION <name> CONCURRENTLY — never transactional (PG17+)
+  if (/\bDETACH\s+PARTITION\s+.+?\s+CONCURRENTLY\b/i.test(sql)) {
     return true;
   }
 
+  // VACUUM — never transactional (except VACUUM ANALYZE)
   if (/\bVACUUM\b/i.test(normalizedSql) &&
       !normalizedSql.includes('ANALYZE') &&
       !normalizedSql.startsWith('ANALYZE')) {
     return true;
   }
 
+  // CLUSTER — never transactional
   if (/\bCLUSTER\b/i.test(normalizedSql) && !/\bCLUSTERED\b/.test(normalizedSql)) {
+    return true;
+  }
+
+  // CREATE DATABASE / DROP DATABASE — never transactional
+  if (/\bCREATE\s+DATABASE\b/i.test(normalizedSql) || /\bDROP\s+DATABASE\b/i.test(normalizedSql)) {
     return true;
   }
 
@@ -186,6 +252,28 @@ async function detectPgVersion(pool) {
 export class MigrationExecutor {
   pgVersion = null;
   connectionId = null;
+  static MIN_POOL_SIZE = 3;
+
+  /**
+   * Validate pool has sufficient connections for migration
+   * @param {import('pg').Pool} pool
+   * @returns {{ valid: boolean, message?: string }}
+   */
+  static validatePool(pool) {
+    if (!pool) {
+      return { valid: false, message: 'Pool is required' };
+    }
+    
+    const poolSize = pool.options?.max || pool.totalCount || 10;
+    if (poolSize < MigrationExecutor.MIN_POOL_SIZE) {
+      return { 
+        valid: false, 
+        message: `Pool size ${poolSize} is too small. Minimum ${MigrationExecutor.MIN_POOL_SIZE} connections required for safe migration execution.`
+      };
+    }
+    
+    return { valid: true };
+  }
 
   /**
    * @param {import('pg').Pool} pool
@@ -198,6 +286,11 @@ export class MigrationExecutor {
     this.introspector = introspector;
     this.storage = storage;
     this.connectionId = config.connectionId || null;
+
+    const poolValidation = MigrationExecutor.validatePool(pool);
+    if (!poolValidation.valid) {
+      console.warn('[MigrationExecutor] Pool validation warning:', poolValidation.message);
+    }
 
     if (!this.connectionId) {
       console.warn(
@@ -222,6 +315,7 @@ export class MigrationExecutor {
     this.lockManager = new LockManager(pool, { connectionId: this.connectionId });
     this.progressTracker = new ProgressTracker();
     this.driftDetector = new DriftDetector();
+    this.crashRecovery = new CrashRecovery(pool, introspector, storage);
 
     this.state = 'idle';
     this.executedSteps = [];
@@ -229,6 +323,35 @@ export class MigrationExecutor {
     this.snapshots = { before: null, after: null };
     this.migrationRecord = null;
     this._heartbeatTimer = null;
+    this._reconciledConnections = new Set();
+  }
+
+  async reconcileIfNeeded(connectionId) {
+    const cid = connectionId || this.connectionId;
+    if (!cid || this._reconciledConnections.has(cid)) {
+      return null;
+    }
+
+    try {
+      const result = await this.crashRecovery.reconcile(cid);
+      this._reconciledConnections.add(cid);
+      
+      if (result.reconciled?.length > 0 || result.failed?.length > 0 || result.manualReview?.length > 0) {
+        this.emitProgress({
+          type: 'reconciliation_complete',
+          connectionId: cid,
+          reconciled: result.reconciled?.length || 0,
+          failed: result.failed?.length || 0,
+          manualReview: result.manualReview?.length || 0,
+          durationMs: result.durationMs,
+        });
+      }
+      
+      return result;
+    } catch (error) {
+      console.warn(`[MigrationExecutor] Reconciliation failed for ${cid}: ${error.message}`);
+      return null;
+    }
   }
 
   /**
@@ -267,16 +390,38 @@ export class MigrationExecutor {
 
       await this.preflightCheck(plan, mergedConfig);
 
+      if (mergedConfig.autoReconcile !== false) {
+        await this.reconcileIfNeeded(connectionId);
+      }
+
       const lockKey = this.lockManager.computeLockKey(connectionId);
       await this.acquireAdvisoryLock({ ...mergedConfig, lockKey });
       this._startLockHeartbeat({ ...mergedConfig, lockKey });
 
-      if (mergedConfig.snapshotBefore) {
-        this.snapshots.before = await this.captureSnapshot();
-      }
+      const lockInfo = this.lockManager.locks.get(lockKey);
+      const lockPid = lockInfo?.client?.connection?.processID || null;
+      
+      const planWithLock = {
+        ...plan,
+        lockKey: String(lockKey),
+        lockPid,
+      };
 
-      this.migrationRecord = await this.storage.createRecord(plan, connectionId);
+      this.migrationRecord = await this.storage.createRecord(planWithLock, connectionId);
       result.migrationId = this.migrationRecord?.id || this.migrationRecord?.migration_id || plan.id;
+
+      if (mergedConfig.snapshotBefore) {
+        try {
+          this.snapshots.before = await this.captureSnapshot();
+        } catch (snapshotError) {
+          console.error('[MigrationExecutor] Snapshot capture failed:', snapshotError.message);
+          result.warnings.push({
+            message: `Snapshot capture failed: ${snapshotError.message}. Proceeding without before-snapshot.`,
+            severity: 'medium',
+          });
+          this.snapshots.before = null;
+        }
+      }
 
       const detectedSteps = this._detectNonTransactionalSteps(plan.steps || [], result);
       const phases = this.groupStepsByPhase(detectedSteps);
@@ -318,7 +463,16 @@ export class MigrationExecutor {
     } catch (error) {
       this.state = 'failed';
       this._stopLockHeartbeat();
-      const recoveryInfo = await this.handleFailure(error, plan);
+      
+      let recoveryInfo = null;
+      try {
+        recoveryInfo = await this.handleFailure(error, plan);
+      } catch (recoveryError) {
+        console.error('[CRITICAL] handleFailure() error:', recoveryError.message);
+        await this.lockManager.release().catch(() => {});
+        recoveryInfo = { state: 'recovery_failed', error: recoveryError.message };
+      }
+      
       result.status = 'FAILED';
       result.success = false;
       result.errors.push({
@@ -326,10 +480,21 @@ export class MigrationExecutor {
         code: error.code || 'UNKNOWN',
         recovery: recoveryInfo,
       });
+      const failedPhase = result.errors?.[0]?.step || this.executedSteps?.[this.executedSteps.length - 1];
       throw new ExecutionError(
-        `Migration failed: ${error.message}`,
+        `Migration ${plan.id} failed at phase ${failedPhase?.phase || '?'} "${this.getPhaseName(failedPhase?.phase) || '?'}" step "${failedPhase?.stepId || '?'}"` +
+        `: ${error.message}${failedPhase?.sql ? `\nSQL: ${failedPhase.sql.substring(0, 300)}` : ''}`,
         { cause: error, recovery: recoveryInfo, result }
       );
+    } finally {
+      this._stopLockHeartbeat();
+      if (this.lockManager.isLocked) {
+        try {
+          await this.lockManager.release();
+        } catch (releaseError) {
+          console.error('[CRITICAL] Lock release failed in finally block:', releaseError.message);
+        }
+      }
     }
   }
 
@@ -338,7 +503,13 @@ export class MigrationExecutor {
    */
   _detectNonTransactionalSteps(steps, result) {
     return steps.map(step => {
-      const detectedNonTx = isNonTransactionalSQL(step.sql || '', { ...step, pgVersion: step.pgVersion || this.pgVersion });
+      const pgVersionInt = step.pgVersionNum || (this.pgVersion ? parseFloat(this.pgVersion) * 10000 : 140000);
+      const detectedNonTx = isNonTransactionalSQL(step.sql || '', {
+        ...step,
+        pgVersion: step.pgVersion || this.pgVersion,
+        pgVersionNum: pgVersionInt,
+        ddlStrategy: step.ddlStrategy || (step.isConcurrent ? 'CREATE_INDEX_CONCURRENTLY' : null),
+      });
 
       if (detectedNonTx && step.isTransactional !== false) {
         result.warnings.push({
@@ -363,25 +534,84 @@ export class MigrationExecutor {
 
   /**
    * Start lock heartbeat timer
+   * Uses database-level lock verification to detect if lock was lost due to
+   * connection issues or manual termination.
    */
   _startLockHeartbeat(config) {
     this._stopLockHeartbeat();
+    this._lockHeartbeatConfig = config;
     if (config.lockHeartbeatInterval > 0) {
       this._heartbeatTimer = setInterval(async () => {
         try {
-          const lockInfo = this.lockManager.isHeldBySelf(config.lockKey || this.lockManager.lockId);
-          if (!lockInfo) {
-            this.emitProgress({
-              type: 'warning',
-              message: 'Advisory lock lost during migration. Another migration may be running.',
-              severity: 'critical',
-            });
-          }
-        } catch {
-          // Ignore heartbeat check errors
+          await this._performHeartbeatCheck(config);
+        } catch (error) {
+          console.error('[MigrationExecutor] Heartbeat check failed:', error.message);
+          this._handleLockLost(error);
         }
       }, config.lockHeartbeatInterval);
     }
+  }
+
+  /**
+   * Perform a heartbeat check by querying the database for lock status.
+   * This is more reliable than in-memory checks because it detects if
+   * the connection was silently dropped or the lock was terminated.
+   */
+  async _performHeartbeatCheck(config) {
+    const lockKey = config.lockKey || this.lockManager.lockId;
+    
+    if (!this.isHeldBySelf(lockKey)) {
+      this.emitProgress({
+        type: 'error',
+        message: 'Advisory lock lost during migration.',
+        severity: 'critical',
+        lockKey,
+        executedSteps: this.executedSteps.length,
+      });
+      
+      throw new LockAcquisitionError(
+        `Advisory lock ${lockKey} lost during migration. ` +
+        `This can happen if: (1) the database connection was recycled, ` +
+        `(2) the backend was terminated manually, ` +
+        `or (3) a connection pool timeout occurred. ` +
+        `Migration state: ${this.state}. ` +
+        `Completed steps: ${this.executedSteps.length}. ` +
+        `To recover: Check the migration history table for status, ` +
+        `verify the current database state with introspection, ` +
+        `and re-run if necessary.`,
+        { 
+          lockId: lockKey, 
+          connectionId: this.connectionId,
+          state: this.state,
+          executedSteps: this.executedSteps.length,
+          lastExecutedStep: this.executedSteps[this.executedSteps.length - 1]?.stepId || null,
+        }
+      );
+    }
+  }
+
+  /**
+   * Check if lock is held by self (in-memory check)
+   */
+  isHeldBySelf(lockKey) {
+    return this.lockManager.isHeldBySelf(lockKey);
+  }
+
+  /**
+   * Handle lock lost during migration
+   * Sets state to 'lock_lost', stops heartbeat, and stores recovery information
+   */
+  _handleLockLost(error) {
+    this.state = 'lock_lost';
+    this._lockLostError = error;
+    this._stopLockHeartbeat();
+    
+    this.emitProgress({
+      type: 'lock_lost',
+      message: error.message,
+      severity: 'critical',
+      recovery: error.details,
+    });
   }
 
   /**
@@ -589,7 +819,10 @@ export class MigrationExecutor {
           if (!config.continueOnError) {
             await client.query('ROLLBACK');
             throw new ExecutionError(
-              `Phase "${phaseName}" failed at step "${step.id}": ${error.message}`,
+              `Phase ${phaseNum} ("${phaseName}") step "${step.id}" — ${step.objectType} "${step.objectKey}"` +
+              `: ${pgError.message}${pgError.detail ? ' — ' + pgError.detail : ''}` +
+              `${pgError.hint ? `\nHint: ${pgError.hint}` : ''}` +
+              `\nSQL: ${(step.sql || '').substring(0, 300)}`,
               { phase: { number: phaseNum, name: phaseName }, step, cause: error, pgError }
             );
           }
@@ -619,7 +852,16 @@ export class MigrationExecutor {
       if (error instanceof ExecutionError) {
         throw error;
       }
-      await client.query('ROLLBACK').catch(() => {});
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('[CRITICAL] ROLLBACK failed:', rollbackError.message);
+        this.emitProgress({
+          type: 'error',
+          message: `ROLLBACK failed: ${rollbackError.message}. Manual intervention may be required.`,
+          severity: 'critical',
+        });
+      }
       throw new ExecutionError(
         `Phase "${phaseName}" failed: ${error.message}`,
         { phase: { number: phaseNum, name: phaseName }, cause: error }
@@ -641,15 +883,26 @@ export class MigrationExecutor {
   }
 
   /**
-   * Execute a step with retry on transient errors
+   * Execute a step with retry on transient errors.
+   * Uses exponential backoff: 1s → 2s → 4s for up to 3 retries.
+   * @param {number} [maxRetries=3] - Industry standard retry count
    */
-  async executeStepWithRetry(client, step, phaseNum, phaseName, config, maxRetries = 2) {
+  async executeStepWithRetry(client, step, phaseNum, phaseName, config, maxRetries = 3) {
     let lastError;
     let attempts = 0;
+    const retryMetadata = { attempts: 0, backoffs: [] };
 
     while (attempts <= maxRetries) {
       try {
         await this.executeStep(client, step, phaseNum, phaseName, config);
+        if (attempts > 0) {
+          this.emitProgress({
+            type: 'step_retry_success',
+            stepId: step.id,
+            totalAttempts: attempts,
+            backoffs: retryMetadata.backoffs,
+          });
+        }
         return;
       } catch (error) {
         lastError = error;
@@ -658,20 +911,54 @@ export class MigrationExecutor {
 
         if (classification.action === 'retry' && attempts < maxRetries) {
           attempts++;
-          await new Promise(resolve => setTimeout(resolve, 1000 * attempts));
+          const backoffMs = 1000 * Math.pow(2, attempts - 1);
+          retryMetadata.backoffs.push(backoffMs);
+          retryMetadata.attempts = attempts;
+          
+          this.emitProgress({
+            type: 'step_retry',
+            stepId: step.id,
+            attempt: attempts,
+            maxRetries,
+            backoffMs,
+            classification: classification.category,
+            sqlState: pgError.code,
+          });
+          
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
           continue;
         }
 
         if (classification.action === 'wait_retry' && attempts < maxRetries) {
           attempts++;
-          await new Promise(resolve => setTimeout(resolve, 3000 * attempts));
+          const backoffMs = 3000 * Math.pow(2, attempts - 1);
+          retryMetadata.backoffs.push(backoffMs);
+          retryMetadata.attempts = attempts;
+          
+          this.emitProgress({
+            type: 'step_retry',
+            stepId: step.id,
+            attempt: attempts,
+            maxRetries,
+            backoffMs,
+            classification: classification.category,
+            sqlState: pgError.code,
+          });
+          
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
           continue;
         }
 
+        if (attempts > 0) {
+          error.retryMetadata = retryMetadata;
+        }
         throw error;
       }
     }
 
+    if (attempts > 0) {
+      lastError.retryMetadata = retryMetadata;
+    }
     throw lastError;
   }
 
@@ -687,6 +974,15 @@ export class MigrationExecutor {
 
     const intent = this._recordIntent(step, 'INTENT');
     result.intents.push(intent);
+
+    if (this.migrationRecord?.id) {
+      await this.storage.updateStepProgress(
+        this.migrationRecord.migration_id,
+        step.id,
+        'intent',
+        null
+      ).catch(() => {});
+    }
 
     if (config.dryRun) {
       this._updateIntent(intent, {
@@ -717,31 +1013,71 @@ export class MigrationExecutor {
       if (statements.length > 1) {
         result.warnings.push({
           step: step.id,
-          message: 'Non-transactional step contains multiple statements; only first will be executed',
+          message: `Non-transactional step contains ${statements.length} SQL statements. Executing all sequentially.`,
           severity: 'medium',
         });
       }
 
-      const sqlToExecute = statements.length > 0 ? statements[0] : step.sql;
-      const startTime = Date.now();
-      const queryResult = await client.query(sqlToExecute);
-      const duration = Date.now() - startTime;
+      const totalStartTime = Date.now();
+      let totalRowsAffected = 0;
+      const statementResults = [];
+
+      for (let i = 0; i < statements.length; i++) {
+        const stmt = statements[i];
+        const stmtStartTime = Date.now();
+        try {
+          const queryResult = await client.query(stmt);
+          const stmtDuration = Date.now() - stmtStartTime;
+          totalRowsAffected += queryResult.rowCount || 0;
+          statementResults.push({
+            index: i,
+            sql: stmt.substring(0, 200),
+            success: true,
+            duration: stmtDuration,
+            rowCount: queryResult.rowCount,
+          });
+        } catch (stmtError) {
+          const pgError = extractPgError(stmtError);
+          statementResults.push({
+            index: i,
+            sql: stmt.substring(0, 200),
+            success: false,
+            error: pgError.message,
+            errorCode: pgError.code,
+          });
+          throw stmtError;
+        }
+      }
+
+      const totalDuration = Date.now() - totalStartTime;
 
       this.executedSteps.push({
         stepId: step.id,
         sql: step.sql,
         phase: phaseNum,
         status: 'completed',
-        duration,
-        rowsAffected: queryResult.rowCount,
+        duration: totalDuration,
+        rowsAffected: totalRowsAffected,
         timestamp: new Date().toISOString(),
         isTransactional: false,
+        statementCount: statements.length,
+        statementResults,
       });
+
+      if (this.migrationRecord?.id) {
+        await this.storage.updateStepProgress(
+          this.migrationRecord.migration_id,
+          step.id,
+          'completed',
+          totalDuration
+        ).catch(() => {});
+      }
 
       this._updateIntent(intent, {
         status: 'COMPLETED',
         completedAt: new Date().toISOString(),
-        durationMs: duration,
+        durationMs: totalDuration,
+        statementCount: statements.length,
       });
 
       result.stepsCompleted++;
@@ -752,20 +1088,74 @@ export class MigrationExecutor {
         phaseName,
         stepId: step.id,
         sql: step.sql,
-        duration,
-        rowsAffected: queryResult.rowCount,
+        duration: totalDuration,
+        rowsAffected: totalRowsAffected,
         isNonTransactional: true,
+        statementCount: statements.length,
       });
 
     } catch (error) {
       const pgError = extractPgError(error);
       const classification = classifyPgError(pgError.code);
 
+      let invalidIndexes = [];
+      const isConcurrentIndex = /CREATE\s+INDEX\s+CONCURRENTLY/i.test(step.sql || '');
+      if (isConcurrentIndex) {
+        try {
+          const indexCheck = await client.query(`
+            SELECT indexname, schemaname 
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE i.indisvalid = false
+              AND c.relname IN (
+                SELECT DISTINCT regexp_matches($1, 'CREATE\s+INDEX\s+CONCURRENTLY\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:\w+\.)?(\w+)', 'gi')
+              )
+          `, [step.sql]);
+          invalidIndexes = indexCheck.rows;
+        } catch {}
+      }
+
+      let vacuumClusterState = null;
+      const isVacuumOrCluster = /\b(VACUUM|CLUSTER)\b/i.test(step.sql || '');
+      if (isVacuumOrCluster) {
+        try {
+          const tableMatch = step.sql.match(/(?:VACUUM\s+(?:FULL\s+)?(?:ANALYZE\s+)?|CLUSTER\s+)(?:\w+\.)?(\w+)/i);
+          if (tableMatch) {
+            const tableName = tableMatch[1];
+            const tableCheck = await client.query(`
+              SELECT c.relname, c.relpages, c.reltuples, pg_stat_get_live_tuples(c.oid) as live_tuples
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relname = $1 AND n.nspname = 'public'
+            `, [tableName]);
+            if (tableCheck.rows.length > 0) {
+              vacuumClusterState = {
+                table: tableName,
+                relpages: tableCheck.rows[0].relpages,
+                reltuples: tableCheck.rows[0].reltuples,
+                liveTuples: tableCheck.rows[0].live_tuples,
+                verified: true,
+              };
+            }
+          }
+        } catch (e) {
+          vacuumClusterState = { verified: false, error: e.message };
+        }
+      }
+
+      const recoveryHint = invalidIndexes.length > 0
+        ? `Invalid indexes detected: ${invalidIndexes.map(i => `${i.schemaname}.${i.indexname}`).join(', ')}. Run: DROP INDEX CONCURRENTLY ${invalidIndexes.map(i => `${i.schemaname}.${i.indexname}`).join('; DROP INDEX CONCURRENTLY ')};`
+        : vacuumClusterState && !vacuumClusterState.verified
+        ? `VACUUM/CLUSTER may be incomplete. Verify table state manually and re-run if needed.`
+        : step.recoverySql || `Manual recovery may be required`;
+
       this._updateIntent(intent, {
         status: 'FAILED',
         completedAt: new Date().toISOString(),
         errorCode: pgError.code,
         errorMessage: pgError.message,
+        invalidIndexes: invalidIndexes.length > 0 ? invalidIndexes : undefined,
       });
 
       result.stepsFailed++;
@@ -779,7 +1169,9 @@ export class MigrationExecutor {
         hint: pgError.hint,
         classification: classification.category,
         isNonTransactional: true,
-        recoveryHint: step.recoverySql || `Manual recovery may be required`,
+        recoveryHint,
+        invalidIndexes: invalidIndexes.length > 0 ? invalidIndexes : undefined,
+        vacuumClusterState,
       });
 
       this.executedSteps.push({
@@ -791,13 +1183,29 @@ export class MigrationExecutor {
         errorCode: pgError.code,
         isTransactional: false,
         timestamp: new Date().toISOString(),
-        recoveryHint: step.recoverySql || null,
+        recoveryHint: recoveryHint.substring(0, 500),
+        invalidIndexes: invalidIndexes.length > 0 ? invalidIndexes : undefined,
+        vacuumClusterState,
       });
+
+      if (this.migrationRecord?.id) {
+        await this.storage.updateStepProgress(
+          this.migrationRecord.migration_id,
+          step.id,
+          'failed',
+          null
+        ).catch(() => {});
+      }
 
       if (!config.continueOnError) {
         throw new ExecutionError(
-          `Non-transactional step "${step.id}" failed: ${error.message}`,
-          { phase: { number: phaseNum, name: phaseName }, step, cause: error, isNonTransactional: true, pgError }
+          `Non-transactional step "${step.id}" — ${step.objectType} "${step.objectKey}"` +
+          `: ${pgError.message}${pgError.detail ? ' — ' + pgError.detail : ''}` +
+          `${pgError.hint ? `\nHint: ${pgError.hint}` : ''}` +
+          `\nSQL: ${(step.sql || '').substring(0, 300)}` +
+          `${invalidIndexes.length > 0 ? `\nInvalid indexes: ${invalidIndexes.map(i => i.indexname).join(', ')}` : ''}` +
+          `\nRecovery: ${recoveryHint.substring(0, 400)}`,
+          { phase: { number: phaseNum, name: phaseName }, step, cause: error, isNonTransactional: true, pgError, invalidIndexes }
         );
       }
 
@@ -806,6 +1214,7 @@ export class MigrationExecutor {
         message: `Non-tx step failed: ${pgError.message} (${pgError.code})`,
         severity: 'high',
         pgCode: pgError.code,
+        invalidIndexes: invalidIndexes.length > 0 ? invalidIndexes : undefined,
       });
     } finally {
       client.release();
@@ -942,39 +1351,115 @@ export class MigrationExecutor {
    * @param {import('../types/migration.js').MigrationPlan} plan
    * @param {ExecutionConfig} config
    */
-  async preflightCheck(plan, config) {
-    await this.pool.query('SELECT 1');
+async preflightCheck(plan, config) {
+      await this.pool.query('SELECT 1');
+  
+      const versionResult = await this.pool.query('SHOW server_version_num');
+      const version = parseInt(versionResult.rows[0].server_version_num);
+  
+      for (const step of plan.steps) {
+        if (step.pgVersionMinimum && version < step.pgVersionMinimum * 10000) {
+          throw new VersionIncompatibilityError(
+            `Step "${step.id}" requires PG ${step.pgVersionMinimum}+ but database is PG ${Math.floor(version / 10000)}`,
+            { requiredVersion: step.pgVersionMinimum, currentVersion: Math.floor(version / 10000) }
+          );
+        }
+      }
+  
+      const longQueries = await this.pool.query(`
+        SELECT pid, now() - pg_stat_activity.query_start AS duration, query
+        FROM pg_stat_activity
+        WHERE state = 'active'
+          AND now() - query_start > interval '30 seconds'
+          AND pid != pg_backend_pid()
+      `);
+      if (longQueries.rows.length > 0) {
+        this.emitProgress({
+          type: 'warning',
+          message: `${longQueries.rows.length} long-running queries detected. Migration may be blocked.`,
+          queries: longQueries.rows,
+          connectionId: config.connectionId,
+        });
+      }
+  
+      await this.storage.ensureTable();
 
-    const versionResult = await this.pool.query('SHOW server_version_num');
-    const version = parseInt(versionResult.rows[0].server_version_num);
+      if (config.verifyHistory !== false) {
+        const integrity = await this.storage.verifyHistoryIntegrity(config.connectionId);
+        if (!integrity.valid) {
+          this.emitProgress({
+            type: 'warning',
+            message: `History integrity check found ${integrity.mismatches.length} checksum mismatch(es)`,
+            mismatches: integrity.mismatches,
+            connectionId: config.connectionId,
+          });
+        }
+      }
 
-    for (const step of plan.steps) {
-      if (step.pgVersionMinimum && version < step.pgVersionMinimum * 10000) {
-        throw new VersionIncompatibilityError(
-          `Step "${step.id}" requires PG ${step.pgVersionMinimum}+ but database is PG ${Math.floor(version / 10000)}`,
-          { requiredVersion: step.pgVersionMinimum, currentVersion: Math.floor(version / 10000) }
-        );
+      if (config.checkDriftBefore !== false) {
+        await this.checkPreMigrationDrift(config);
       }
     }
 
-    const longQueries = await this.pool.query(`
-      SELECT pid, now() - pg_stat_activity.query_start AS duration, query
-      FROM pg_stat_activity
-      WHERE state = 'active'
-        AND now() - query_start > interval '30 seconds'
-        AND pid != pg_backend_pid()
-    `);
-    if (longQueries.rows.length > 0) {
-      this.emitProgress({
-        type: 'warning',
-        message: `${longQueries.rows.length} long-running queries detected. Migration may be blocked.`,
-        queries: longQueries.rows,
-        connectionId: config.connectionId,
-      });
-    }
+    async checkPreMigrationDrift(config) {
+      const lastMigration = await this.storage.getLastMigration(config.connectionId, true);
+      
+      if (!lastMigration?.snapshot_after) {
+        this.emitProgress({
+          type: 'info',
+          message: 'No baseline snapshot found - skipping pre-migration drift check',
+          connectionId: config.connectionId,
+        });
+        return;
+      }
 
-    await this.storage.ensureTable();
-  }
+      let expectedSnapshot;
+      try {
+        expectedSnapshot = typeof lastMigration.snapshot_after === 'string' 
+          ? JSON.parse(lastMigration.snapshot_after) 
+          : lastMigration.snapshot_after;
+      } catch (e) {
+        this.emitProgress({
+          type: 'warning',
+          message: 'Could not parse baseline snapshot - skipping drift check',
+          connectionId: config.connectionId,
+        });
+        return;
+      }
+
+      const currentSnapshot = await this.captureSnapshot();
+
+      const drift = this.driftDetector.detect(expectedSnapshot, currentSnapshot, { changes: [] });
+      
+      if (drift.detected) {
+        const summary = `Objects created: ${drift.summary.objectsCreated || 0}, ` +
+          `Objects dropped: ${drift.summary.objectsDropped || 0}, ` +
+          `Objects modified: ${drift.summary.objectsModified || 0}`;
+
+        if (config.abortOnDrift !== false) {
+          throw new DriftDetectedError(
+            `Pre-migration drift detected: ${summary}. ` +
+            `Set abortOnDrift: false to proceed anyway, or run reconciliation first.`,
+            { drift, phase: 'pre_migration', expectedSnapshot, currentSnapshot }
+          );
+        }
+
+        this.emitProgress({
+          type: 'warning',
+          message: `Pre-migration drift detected (proceeding): ${summary}`,
+          drift,
+          connectionId: config.connectionId,
+        });
+
+        config._driftDetected = drift;
+      } else {
+        this.emitProgress({
+          type: 'info',
+          message: 'Pre-migration drift check passed - schema is consistent',
+          connectionId: config.connectionId,
+        });
+      }
+    }
 
   /**
    * Acquire advisory lock
@@ -985,7 +1470,11 @@ export class MigrationExecutor {
     const acquired = await this.lockManager.acquire(lockKey, config.lockTimeout);
     if (!acquired) {
       throw new MigrationConflictError(
-        'Failed to acquire migration lock. Another migration may be in progress.'
+        `Failed to acquire advisory lock ${lockKey} (connectionId: ${config.connectionId}) within "${config.lockTimeout}". ` +
+        `Another migration may be in progress on this database. ` +
+        `To resolve: (1) wait for the running migration to complete, (2) terminate the conflicting backend ` +
+        `(SELECT pg_terminate_backend(pid) FROM pg_locks WHERE objid = ${lockKey}), ` +
+        `or (3) use a different connectionId.`
       );
     }
     this.emitProgress({ type: 'lock_acquired', lockKey, connectionId: config.connectionId });
@@ -1013,8 +1502,12 @@ export class MigrationExecutor {
       );
 
       if (drift.detected) {
+        const driftChanges = (drift.changes || []).map(c => c.objectKey || c.name || c).join(', ');
         throw new DriftDetectedError(
-          'Schema drift detected during migration execution',
+          `Schema drift detected during migration ${plan.id}: ${drift.changeCount || drift.changes?.length || 0} unexpected change(s)` +
+          `${driftChanges ? `. Affected objects: ${driftChanges}` : ''}. ` +
+          `This may indicate concurrent modifications to the database during migration. ` +
+          `Review the drift and re-run introspection to reconcile.`,
           { drift }
         );
       }
@@ -1032,7 +1525,7 @@ export class MigrationExecutor {
         n.nspname as schema,
         c.relname as name,
         c.relkind as kind,
-        md5(n.nspname || '.' || c.relname || '.' || c.relkind) as checksum
+        md5(n.nspname || '.'::text || c.relname || '.'::text || c.relkind::text) as checksum
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
@@ -1053,6 +1546,285 @@ export class MigrationExecutor {
   }
 
   /**
+   * Verify that a DDL step was actually applied to the database.
+   * Used for connection drop recovery to determine if COMMIT succeeded.
+   * @param {Object} step - The step to verify
+   * @returns {Promise<{applied: boolean, details: Object}>}
+   */
+  async verifyStepApplied(step) {
+    const client = await this.pool.connect();
+    try {
+      const objectName = step.objectName || step.objectKey?.split('.').pop();
+      const schemaName = step.schema || step.objectKey?.split('.')[0] || 'public';
+
+      switch (step.objectType) {
+        case 'table': {
+          const check = await client.query(`
+            SELECT EXISTS (
+              SELECT FROM information_schema.tables
+              WHERE table_schema = $1 AND table_name = $2
+            )
+          `, [schemaName, objectName]);
+          return { applied: check.rows[0].exists, details: { type: 'table', name: objectName } };
+        }
+        
+        case 'index': {
+          const check = await client.query(`
+            SELECT EXISTS (
+              SELECT FROM pg_indexes
+              WHERE schemaname = $1 AND indexname = $2
+            )
+          `, [schemaName, objectName]);
+          return { applied: check.rows[0].exists, details: { type: 'index', name: objectName } };
+        }
+        
+        case 'column': {
+          const tableName = step.tableName || step.objectKey?.split('.')[1];
+          const check = await client.query(`
+            SELECT EXISTS (
+              SELECT FROM information_schema.columns
+              WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+            )
+          `, [schemaName, tableName, objectName]);
+          return { applied: check.rows[0].exists, details: { type: 'column', table: tableName, name: objectName } };
+        }
+        
+        case 'constraint': {
+          const check = await client.query(`
+            SELECT EXISTS (
+              SELECT FROM pg_constraint
+              WHERE connamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+                AND conname = $2
+            )
+          `, [schemaName, objectName]);
+          return { applied: check.rows[0].exists, details: { type: 'constraint', name: objectName } };
+        }
+        
+        case 'function':
+        case 'procedure': {
+          const check = await client.query(`
+            SELECT EXISTS (
+              SELECT FROM pg_proc p
+              JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = $1 AND p.proname = $2
+            )
+          `, [schemaName, objectName]);
+          return { applied: check.rows[0].exists, details: { type: step.objectType, name: objectName } };
+        }
+        
+        case 'trigger': {
+          const check = await client.query(`
+            SELECT EXISTS (
+              SELECT FROM pg_trigger
+              WHERE tgname = $1
+            )
+          `, [objectName]);
+          return { applied: check.rows[0].exists, details: { type: 'trigger', name: objectName } };
+        }
+        
+        case 'type':
+        case 'enum': {
+          const check = await client.query(`
+            SELECT EXISTS (
+              SELECT FROM pg_type t
+              JOIN pg_namespace n ON n.oid = t.typnamespace
+              WHERE n.nspname = $1 AND t.typname = $2
+            )
+          `, [schemaName, objectName]);
+          return { applied: check.rows[0].exists, details: { type: 'type', name: objectName } };
+        }
+        
+        case 'enum_value': {
+          const enumValueCheck = await this.verifyEnumValue(step);
+          return enumValueCheck;
+        }
+        
+        case 'partition': {
+          const partitionCheck = await this.verifyPartitionState(step);
+          return partitionCheck;
+        }
+        
+        default:
+          return { applied: false, details: { type: 'unknown', reason: 'Cannot verify this object type' } };
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Verify if an enum value was added (for ALTER TYPE ADD VALUE on PG14-15).
+   * @param {Object} step - The step containing enum value details
+   * @returns {Promise<{applied: boolean, details: Object}>}
+   */
+  async verifyEnumValue(step) {
+    const client = await this.pool.connect();
+    try {
+      const typeName = step.typeName || step.objectName;
+      const valueName = step.valueName || step.enumValue;
+      const schemaName = step.schema || 'public';
+      
+      const check = await client.query(`
+        SELECT EXISTS (
+          SELECT FROM pg_enum e
+          JOIN pg_type t ON t.oid = e.enumtypid
+          JOIN pg_namespace n ON n.oid = t.typnamespace
+          WHERE n.nspname = $1 
+            AND t.typname = $2 
+            AND e.enumlabel = $3
+        )
+      `, [schemaName, typeName, valueName]);
+      
+      return {
+        applied: check.rows[0].exists,
+        details: {
+          type: 'enum_value',
+          typeName,
+          valueName,
+          schema: schemaName,
+        },
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Verify the state of a partition (for DETACH PARTITION CONCURRENTLY).
+   * @param {Object} step - The step containing partition details
+   * @returns {Promise<{applied: boolean, details: Object}>}
+   */
+  async verifyPartitionState(step) {
+    const client = await this.pool.connect();
+    try {
+      const partitionName = step.partitionName || step.objectName;
+      const parentTable = step.parentTable;
+      const schemaName = step.schema || 'public';
+      
+      const check = await client.query(`
+        SELECT 
+          c.relname as name,
+          c.relispartition as is_partition,
+          CASE 
+            WHEN c.relispartition THEN 'attached'
+            ELSE 'detached'
+          END as state,
+          p.relname as parent_name
+        FROM pg_class c
+        LEFT JOIN pg_inherits i ON i.inhrelid = c.oid
+        LEFT JOIN pg_class p ON p.oid = i.inhparent
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2
+      `, [schemaName, partitionName]);
+      
+      if (check.rows.length === 0) {
+        return {
+          applied: false,
+          details: {
+            type: 'partition',
+            name: partitionName,
+            reason: 'Partition not found',
+          },
+        };
+      }
+      
+      const row = check.rows[0];
+      const expectedState = step.targetState || 'detached';
+      const isApplied = expectedState === 'detached' ? !row.is_partition : row.is_partition;
+      
+      return {
+        applied: isApplied,
+        details: {
+          type: 'partition',
+          name: partitionName,
+          currentState: row.state,
+          expectedState,
+          parentTable: row.parent_name,
+        },
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Recover from a connection drop by verifying the actual database state.
+   * Call this when a connection error occurs after COMMIT was sent.
+   * @param {Object} plan - The migration plan that was executing
+   * @returns {Promise<{recovered: boolean, state: string, appliedSteps: Array}>}
+   */
+  async recoverFromConnectionDrop(plan) {
+    this.emitProgress({
+      type: 'connection_recovery_start',
+      planId: plan.id,
+      timestamp: new Date().toISOString(),
+    });
+
+    const appliedSteps = [];
+    const steps = plan.steps || [];
+
+    for (const step of steps) {
+      if (step.type === 'pre_check' || step.type === 'advisory_lock' || step.type === 'snapshot' || step.type === 'verify') {
+        continue;
+      }
+
+      try {
+        const verification = await this.verifyStepApplied(step);
+        if (verification.applied) {
+          appliedSteps.push({
+            stepId: step.id,
+            objectType: step.objectType,
+            objectKey: step.objectKey,
+            verified: true,
+          });
+        }
+      } catch (verifyError) {
+        this.emitProgress({
+          type: 'verification_error',
+          stepId: step.id,
+          error: verifyError.message,
+        });
+      }
+    }
+
+    const state = appliedSteps.length === steps.length
+      ? 'fully_applied'
+      : appliedSteps.length > 0
+        ? 'partially_applied'
+        : 'not_applied';
+
+    this.emitProgress({
+      type: 'connection_recovery_complete',
+      planId: plan.id,
+      state,
+      appliedSteps: appliedSteps.length,
+      totalSteps: steps.length,
+    });
+
+    return {
+      recovered: true,
+      state,
+      appliedSteps,
+      allApplied: appliedSteps.length === steps.length,
+    };
+  }
+
+  /**
+   * Check if an error is a connection-related error that warrants recovery.
+   * @param {Error} error
+   * @returns {boolean}
+   */
+  isConnectionError(error) {
+    const connectionCodes = ['08001', '08003', '08004', '08006', '08007', '57P01'];
+    const errorCode = error.code || '';
+    return connectionCodes.includes(errorCode) ||
+           error.code === 'ECONNRESET' ||
+           error.code === 'ETIMEDOUT' ||
+           error.message?.toLowerCase().includes('connection') ||
+           error.message?.toLowerCase().includes('terminate');
+  }
+
+  /**
    * Handle execution failure
    * @param {Error} error
    * @param {import('../types/migration.js').MigrationPlan} plan
@@ -1066,6 +1838,43 @@ export class MigrationExecutor {
     const nonTransactionalExecuted = this.executedSteps.filter(
       s => s.status === 'completed' && s.isTransactional === false
     );
+
+    let connectionRecovery = null;
+    if (this.isConnectionError(error)) {
+      this.emitProgress({
+        type: 'connection_error_detected',
+        error: error.message,
+        code: error.code,
+        attemptingRecovery: true,
+      });
+      
+      try {
+        connectionRecovery = await this.recoverFromConnectionDrop(plan);
+        
+        if (connectionRecovery.state === 'fully_applied') {
+          if (this.migrationRecord?.migration_id) {
+            await this.storage.updateRecord(this.migrationRecord.migration_id, {
+              status: 'COMPLETED',
+              completed_at: new Date().toISOString(),
+              connection_recovery: connectionRecovery,
+            });
+          }
+          await this.releaseAdvisoryLock();
+          return {
+            state: 'recovered_committed',
+            originalError: error.message,
+            connectionRecovery,
+            executedPhases: executedPhaseNames,
+          };
+        }
+      } catch (recoveryError) {
+        this.emitProgress({
+          type: 'connection_recovery_failed',
+          error: recoveryError.message,
+        });
+        connectionRecovery = { state: 'recovery_failed', error: recoveryError.message };
+      }
+    }
 
     if (this.migrationRecord?.migration_id) {
       await this.storage.failRecord(
@@ -1088,6 +1897,7 @@ export class MigrationExecutor {
       rollbackStatus: nonTransactionalExecuted.length > 0 ? 'PARTIAL' : 'FULL',
       manualRecoveryRequired: nonTransactionalExecuted.length > 0,
       recoverySQL: nonTransactionalExecuted.map(s => this.generateUndoSQL(s)).filter(Boolean),
+      connectionRecovery,
     };
   }
 
@@ -1245,5 +2055,31 @@ export class MigrationExecutor {
    */
   async dryRun(plan, options = {}) {
     return this.execute(plan, { ...options, dryRun: true });
+  }
+
+  /**
+   * Manually trigger reconciliation for a connection
+   * @param {string} [connectionId] - Connection ID to reconcile (defaults to this.connectionId)
+   * @returns {Promise<Object>} Reconciliation results
+   */
+  async reconcile(connectionId) {
+    const cid = connectionId || this.connectionId;
+    if (!cid) {
+      throw new Error('Cannot reconcile without connectionId');
+    }
+    return await this.crashRecovery.reconcile(cid);
+  }
+
+  /**
+   * Check for incomplete migrations without reconciling
+   * @param {string} [connectionId]
+   * @returns {Promise<Array>} List of running migrations
+   */
+  async getIncompleteMigrations(connectionId) {
+    const cid = connectionId || this.connectionId;
+    if (!cid) {
+      return [];
+    }
+    return await this.storage.getByStatus(cid, 'running');
   }
 }

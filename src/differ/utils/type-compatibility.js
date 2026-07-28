@@ -1,6 +1,6 @@
 /**
- * PostgreSQL type compatibility and cast matrix.
- * Determines if type changes are safe, need USING clause, or are impossible.
+ * Schema Weaver Migration Engine - Schema Differ - Utilities
+ * https://schemaweaver.vivekmind.com/
  */
 
 /**

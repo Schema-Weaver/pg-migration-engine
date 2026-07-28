@@ -1,6 +1,6 @@
 /**
- * @param {import('../types/changes.js').SchemaChange} change
- * @returns {string}
+ * Schema Weaver Migration Engine - DDL Generator
+ * https://schemaweaver.vivekmind.com/
  */
 export function generateRenameSql(change) {
   if (!change.isRename) return '';

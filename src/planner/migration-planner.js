@@ -1,6 +1,12 @@
+/**
+ * Schema Weaver Migration Engine - Migration Planner
+ * https://schemaweaver.vivekmind.com/
+ */
+import crypto from 'crypto';
 import { SmartMigrator } from './smart-migrator.js';
 import { BackfillPlanner } from './backfill-planner.js';
 import { StepSequencer } from './step-sequencer.js';
+import { DdlGenerator } from '../ddl-generator/statement-factory.js';
 
 const DROP_PHASES = {
   behavioral: 27,
@@ -101,9 +107,16 @@ export class MigrationPlanner {
    * @param {import('../types/execution.js').PlanOptions} options
    * @returns {import('../types/migration.js').MigrationPlan}
    */
-  createPlan(changes, options) {
+  createPlan(changes, options = {}) {
     const changesArray = Array.isArray(changes) ? changes : (changes.changes || []);
     const warnings = Array.isArray(changes) ? [] : (changes.warnings || []);
+
+    const generator = new DdlGenerator();
+    for (const change of changesArray) {
+      if (!change.sql) {
+        change.sql = generator.generate([change], options);
+      }
+    }
 
     this.correlateRenames(changesArray);
     
@@ -121,15 +134,21 @@ export class MigrationPlanner {
       dependencies: [],
     });
 
+    // Note: Advisory lock acquisition is now handled by MigrationExecutor
+    // The step below is a legacy placeholder. The actual lock is acquired
+    // before any migration steps are executed.
+    // This step can be safely removed in a future version.
     steps.push({
       id: `step_${String(stepId++).padStart(3, '0')}`,
       type: 'advisory_lock',
-      phase: 0,
-      description: 'Acquire migration advisory lock',
-      sql: 'SELECT pg_try_advisory_xact_lock(12345);',
+      phase: 1,
+      description: '[DEPRECATED] Advisory lock placeholder - lock is acquired by executor',
+      sql: 'SELECT 1 as lock_placeholder;',
       isTransactional: true,
       riskLevel: 'none',
       dependencies: [`step_001`],
+      deprecated: true,
+      note: 'Actual advisory lock acquisition is handled by MigrationExecutor.acquireAdvisoryLock()',
     });
 
     const phases = {};
@@ -229,11 +248,14 @@ export class MigrationPlanner {
     const sequencedSteps = this.sequencer.sequence(changesArray, steps);
     const summary = Array.isArray(changes) ? this.buildSummary(changes) : changes.summary;
 
+    const changeKeys = changesArray.map(c => c.objectKey || c.id).sort().join(',');
+    const contentHash = crypto.createHash('sha256').update(changeKeys).digest('hex').slice(0, 12);
+
     return {
-      id: `migration_${Date.now()}`,
-      name: options.name || `migration_${Date.now()}`,
+      id: `migration_${contentHash}`,
+      name: options.name || `migration`,
       description: options.description,
-      createdAt: new Date().toISOString(),
+      createdAt: null,
       sourceChecksum: options.sourceChecksum,
       targetChecksum: options.targetChecksum,
       changes: changesArray,
@@ -317,11 +339,11 @@ export class MigrationPlanner {
     if (changeType === 'CREATE' || changeType?.startsWith('ADD')) {
       if (objType === 'extension') return 3;
       if (objType === 'schema') return 5;
-      if (objType === 'type') return 4;
+      if (objType === 'type' || objType === 'domain') return 4;
+      if (objType === 'sequence') return 5;
       if (objType === 'table') return 6;
       if (objType === 'foreignTable') return 6;
       if (objType === 'column') return 7;
-      if (objType === 'sequence') return 8;
       if (objType === 'index') return change.isNonTransactional || change.isConcurrent ? 23 : 9;
       if (objType === 'constraint' && change.constraintType !== 'FOREIGN_KEY') return 10;
       if (objType === 'view') return 14;

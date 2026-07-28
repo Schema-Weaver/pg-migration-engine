@@ -1,4 +1,10 @@
-const SUBSCRIPTIONS_QUERY = `
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
+const PG_VERSION_19 = 190000;
+
+const SUBSCRIPTIONS_QUERY_PG19 = `
 SELECT
   s.oid,
   s.subname AS name,
@@ -12,7 +18,35 @@ SELECT
   s.substream AS streaming,
   s.subtwophasestate AS two_phase_state,
   CASE WHEN s.subdisableonerr THEN true ELSE false END AS disable_on_error,
-  s.suborigin AS origin,
+  s.submaxretention AS max_retention,
+  s.subretentionactive AS retention_active,
+  /* SUBORIGIN_PLACEHOLDER */
+  /* SUBRUNASOWNER_PLACEHOLDER */
+  /* SUBFAILOVER_PLACEHOLDER */
+  pg_catalog.obj_description(s.oid, 'pg_subscription') AS comment
+FROM pg_catalog.pg_subscription s
+ORDER BY s.subname
+`;
+
+const SUBSCRIPTIONS_QUERY_PRE_PG19 = `
+SELECT
+  s.oid,
+  s.subname AS name,
+  pg_catalog.pg_get_userbyid(s.subowner) AS owner,
+  s.subconninfo AS conninfo,
+  s.subslotname AS slot_name,
+  s.subsynccommit AS sync_commit,
+  s.subenabled AS enabled,
+  s.subpublications AS publications,
+  s.subbinary AS binary_transfer,
+  s.substream AS streaming,
+  s.subtwophasestate AS two_phase_state,
+  CASE WHEN s.subdisableonerr THEN true ELSE false END AS disable_on_error,
+  NULL::text AS max_retention,
+  false AS retention_active,
+  /* SUBORIGIN_PLACEHOLDER */
+  /* SUBRUNASOWNER_PLACEHOLDER */
+  /* SUBFAILOVER_PLACEHOLDER */
   pg_catalog.obj_description(s.oid, 'pg_subscription') AS comment
 FROM pg_catalog.pg_subscription s
 ORDER BY s.subname
@@ -40,17 +74,31 @@ export async function querySubscriptions(pool, version) {
   if (version < 100000) return [];
 
   try {
-    const subsResult = await pool.query(SUBSCRIPTIONS_QUERY);
-    let tablesResult = { rows: [] };
+    const hasPg16Columns = version >= 160000;
+    const hasPg17Columns = version >= 170000;
+    const suboriginCol = hasPg16Columns ? 's.suborigin AS origin,' : 'NULL::text AS origin,';
+    const subrunasownerCol = hasPg16Columns ? 's.subrunasowner AS run_as_owner,' : 'false AS run_as_owner,';
+    const subfailoverCol = hasPg17Columns ? 's.subfailover AS failover,' : 'false AS failover,';
     
+    const baseQuery = version >= PG_VERSION_19 
+      ? SUBSCRIPTIONS_QUERY_PG19 
+      : SUBSCRIPTIONS_QUERY_PRE_PG19;
+    
+    const query = baseQuery
+      .replace('/* SUBORIGIN_PLACEHOLDER */', suboriginCol)
+      .replace('/* SUBRUNASOWNER_PLACEHOLDER */', subrunasownerCol)
+      .replace('/* SUBFAILOVER_PLACEHOLDER */', subfailoverCol);
+
+    const subsResult = await pool.query(query);
+    let tablesResult = { rows: [] };
+
     try {
       tablesResult = await pool.query(SUBSCRIPTION_TABLES_QUERY);
     } catch (e) {
-      // Table may not exist if no subscription tables
     }
 
     const subMap = new Map();
-    
+
     for (const row of subsResult.rows) {
       let publications = [];
       if (row.publications && typeof row.publications === 'string') {
@@ -77,6 +125,10 @@ export async function querySubscriptions(pool, version) {
         two_phase: row.two_phase_state && row.two_phase_state !== 'd',
         disable_on_error: row.disable_on_error || false,
         origin: row.origin || 'any',
+        run_as_owner: row.run_as_owner || false,
+        failover: row.failover || false,
+        max_retention: row.max_retention || null,
+        retention_active: row.retention_active || false,
         comment: row.comment,
         tables: [],
       });

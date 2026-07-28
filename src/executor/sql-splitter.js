@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Migration Executor
+ * https://schemaweaver.vivekmind.com/
+ */
 const DOLLAR_QUOTE_REGEX = /\$([a-zA-Z_][a-zA-Z0-9_]*)?\$/g;
 
 export function splitSqlStatements(sql) {

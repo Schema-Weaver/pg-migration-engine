@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const PARTITIONS_QUERY = `
 SELECT parent.relname AS parent_table,
        pn.nspname AS parent_schema,
@@ -28,7 +32,8 @@ WHERE parent.relkind = 'p'
   AND pn.nspname NOT LIKE 'pg_temp_%'
 GROUP BY parent.oid, parent.relname, pn.nspname,
          child.oid, child.relname, cn.nspname,
-         pt.partstrat, pt.partnatts, child.relpartbound, child.relispartition, pt.partexprs
+         pt.partstrat, pt.partnatts, child.relpartbound, child.relispartition, 
+         pt.partexprs, pt.partrelid
 ORDER BY pn.nspname, parent.relname, child.relname
 `;
 

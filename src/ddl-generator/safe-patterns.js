@@ -1,5 +1,6 @@
 /**
- * Generate safe patterns for potentially destructive changes.
+ * Schema Weaver Migration Engine - DDL Generator
+ * https://schemaweaver.vivekmind.com/
  */
 
 const qi = name => name === '*' ? name : '"' + name.replace(/"/g, '""') + '"';
@@ -17,7 +18,7 @@ export function generateSafePatterns(change) {
     const table = parts.join('.');
     const checkName = `${table.replace(/\./g, '_')}_${col}_not_null_chk`;
     steps.push({
-      id: `step_${Date.now()}_1`,
+      id: `safe_nn_${change.id || '1'}_1`,
       type: 'constraint',
       phase: 10,
       description: `Add CHECK NOT NULL (NOT VALID) for ${table}.${col}`,
@@ -27,7 +28,7 @@ export function generateSafePatterns(change) {
       dependencies: [],
     });
     steps.push({
-      id: `step_${Date.now()}_2`,
+      id: `safe_nn_${change.id || '1'}_2`,
       type: 'constraint',
       phase: 13,
       description: `Validate CHECK constraint ${checkName}`,
@@ -37,7 +38,7 @@ export function generateSafePatterns(change) {
       dependencies: [steps[0].id],
     });
     steps.push({
-      id: `step_${Date.now()}_3`,
+      id: `safe_nn_${change.id || '1'}_3`,
       type: 'structural',
       phase: 11,
       description: `Convert CHECK to NOT NULL for ${table}.${col}`,
@@ -53,7 +54,7 @@ export function generateSafePatterns(change) {
   if (objectType === 'constraint' && (change.after?.constraintType === 'FOREIGN_KEY' || change.after?.type === 'FOREIGN_KEY')) {
     const con = change.after;
     steps.push({
-      id: `step_${Date.now()}_1`,
+      id: `safe_fk_${change.id || '1'}_1`,
       type: 'constraint',
       phase: 12,
       description: `Add FK ${con.name} NOT VALID`,
@@ -63,7 +64,7 @@ export function generateSafePatterns(change) {
       dependencies: [],
     });
     steps.push({
-      id: `step_${Date.now()}_2`,
+      id: `safe_fk_${change.id || '1'}_2`,
       type: 'constraint',
       phase: 13,
       description: `Validate FK ${con.name}`,
@@ -79,7 +80,7 @@ export function generateSafePatterns(change) {
   if (objectType === 'index' && changeType === 'CREATE' && !change.after?.isConcurrent) {
     const idx = change.after;
     steps.push({
-      id: `step_${Date.now()}_1`,
+      id: `safe_idx_${change.id || '1'}_1`,
       type: 'index',
       phase: 23,
       description: `Create index ${idx.name} CONCURRENTLY`,
@@ -100,7 +101,7 @@ export function generateSafePatterns(change) {
       const col = parts.pop();
       const table = parts.join('.');
       steps.push({
-        id: `step_${Date.now()}_1`,
+        id: `safe_type_${change.id || '1'}_1`,
         type: 'structural',
         phase: 11,
         description: `Alter type of ${table}.${col} from ${currentType} to ${desiredType}`,
@@ -119,7 +120,7 @@ export function generateSafePatterns(change) {
     const table = con._tableKey || con.table;
     const tempIdxName = `${con.name}_unique_build`;
     steps.push({
-      id: `step_${Date.now()}_1`,
+      id: `safe_uq_${change.id || '1'}_1`,
       type: 'index',
       phase: 23,
       description: `Create unique index CONCURRENTLY for ${con.name}`,
@@ -129,7 +130,7 @@ export function generateSafePatterns(change) {
       dependencies: [],
     });
     steps.push({
-      id: `step_${Date.now()}_2`,
+      id: `safe_uq_${change.id || '1'}_2`,
       type: 'constraint',
       phase: 24,
       description: `Add unique constraint using existing index`,
@@ -146,7 +147,7 @@ export function generateSafePatterns(change) {
     const con = change.after;
     const table = con._tableKey || con.table;
     steps.push({
-      id: `step_${Date.now()}_1`,
+      id: `safe_chk_${change.id || '1'}_1`,
       type: 'constraint',
       phase: 10,
       description: `Add CHECK constraint ${con.name} NOT VALID`,
@@ -156,7 +157,7 @@ export function generateSafePatterns(change) {
       dependencies: [],
     });
     steps.push({
-      id: `step_${Date.now()}_2`,
+      id: `safe_chk_${change.id || '1'}_2`,
       type: 'constraint',
       phase: 13,
       description: `Validate CHECK constraint ${con.name}`,
@@ -173,7 +174,7 @@ export function generateSafePatterns(change) {
     const mv = change.after;
     if (mv.isWithData !== false) {
       steps.push({
-        id: `step_${Date.now()}_1`,
+        id: `safe_mv_${change.id || '1'}_1`,
         type: 'structural',
         phase: 15,
         description: `Refresh materialized view ${change.objectKey}`,
@@ -186,7 +187,7 @@ export function generateSafePatterns(change) {
     }
   }
 
-  // Multi-step impossible type change (add column → copy → drop old → rename)
+  // Multi-step impossible type change (add column -> copy -> drop old -> rename)
   if (objectType === 'column' && property === 'dataType' && change.changeType === 'IMPOSSIBLE_CAST') {
     const parts = change.objectKey.split('.');
     const col = parts.pop();
@@ -195,7 +196,7 @@ export function generateSafePatterns(change) {
     const oldColName = `${col}_old`;
 
     steps.push({
-      id: `step_${Date.now()}_1`,
+      id: `safe_imp_${change.id || '1'}_1`,
       type: 'structural',
       phase: 7,
       description: `Add temporary column ${newColName}`,
@@ -205,7 +206,7 @@ export function generateSafePatterns(change) {
       dependencies: [],
     });
     steps.push({
-      id: `step_${Date.now()}_2`,
+      id: `safe_imp_${change.id || '1'}_2`,
       type: 'structural',
       phase: 11,
       description: `Copy data with transformation`,
@@ -215,7 +216,7 @@ export function generateSafePatterns(change) {
       dependencies: [steps[0].id],
     });
     steps.push({
-      id: `step_${Date.now()}_3`,
+      id: `safe_imp_${change.id || '1'}_3`,
       type: 'structural',
       phase: 11,
       description: `Drop old column`,
@@ -225,7 +226,7 @@ export function generateSafePatterns(change) {
       dependencies: [steps[1].id],
     });
     steps.push({
-      id: `step_${Date.now()}_4`,
+      id: `safe_imp_${change.id || '1'}_4`,
       type: 'structural',
       phase: 11,
       description: `Rename new column to original name`,

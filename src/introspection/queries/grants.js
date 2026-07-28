@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const GRANTS_QUERY = `
 SELECT n.nspname AS schema,
        c.relname AS object,

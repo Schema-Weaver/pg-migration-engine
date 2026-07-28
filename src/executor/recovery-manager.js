@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Migration Executor
+ * https://schemaweaver.vivekmind.com/
+ */
 export class RecoveryManager {
   /** @param {import('../types/execution.js').StorageProvider} storage */
   constructor(storage) {

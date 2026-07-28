@@ -1,6 +1,6 @@
 /**
- * @param {import('../types/risk.js').RiskFinding} finding
- * @returns {string}
+ * Schema Weaver Migration Engine - Risk Engine
+ * https://schemaweaver.vivekmind.com/
  */
 export function generateRecommendation(finding) {
   if (finding.safeAlternative) {

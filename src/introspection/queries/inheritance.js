@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const INHERITANCE_QUERY = `
 SELECT child.relname AS child_table,
        cn.nspname AS child_schema,

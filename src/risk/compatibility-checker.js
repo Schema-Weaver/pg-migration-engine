@@ -1,7 +1,6 @@
 /**
- * @param {import('../types/changes.js').SchemaChange} change
- * @param {number} pgVersion
- * @returns {import('../types/risk.js').RiskFinding[]}
+ * Schema Weaver Migration Engine - Risk Engine
+ * https://schemaweaver.vivekmind.com/
  */
 export function checkCompatibility(change, pgVersion) {
   const findings = [];

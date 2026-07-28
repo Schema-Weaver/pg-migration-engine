@@ -1,5 +1,6 @@
 /**
- * @typedef {'none'|'low'|'medium'|'high'|'critical'} RiskLevel
+ * Schema Weaver Migration Engine - Type Definitions
+ * https://schemaweaver.vivekmind.com/
  */
 
 /**

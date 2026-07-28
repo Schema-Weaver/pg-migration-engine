@@ -1,6 +1,6 @@
 /**
- * Behavioral Extractor - Extract behavioral objects from SchemaSnapshot
- * Behavioral objects: views, functions, triggers, policies, rules, event triggers
+ * Schema Weaver Migration Engine - Behavioral DDL
+ * https://schemaweaver.vivekmind.com/
  */
 
 export class BehavioralExtractor {

@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Risk Engine
+ * https://schemaweaver.vivekmind.com/
+ */
 import { checkDestructive } from './destructive-checker.js';
 import { checkDataLoss } from './data-loss-checker.js';
 import { checkLockRisk } from './lock-analyzer.js';

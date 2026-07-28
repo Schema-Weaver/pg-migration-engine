@@ -1,8 +1,6 @@
 /**
- * Schema Weaver Migration Engine - Shared Constants
- *
- * This file defines the canonical values used across ALL layers.
- * No layer should define its own status values or risk levels.
+ * Schema Weaver Migration Engine - Core
+ * https://schemaweaver.vivekmind.com/
  */
 
 export const MIGRATION_STATUS = Object.freeze({
@@ -54,6 +52,49 @@ export const DROP_PHASES = Object.freeze({
   structural: 32,
 });
 
+/**
+ * Retry configuration for transient failures.
+ * Following industry standards: max 3 retries, exponential backoff.
+ */
+export const RETRY_CONFIG = Object.freeze({
+  MAX_RETRIES: 3,
+  INITIAL_BACKOFF_MS: 1000,
+  BACKOFF_MULTIPLIER: 2,
+  MAX_BACKOFF_MS: 10000,
+  
+  TRANSIENT_SQLSTATES: Object.freeze(new Set([
+    '40P01',
+    '40001',
+    '55P03',
+    '08001',
+    '08003',
+    '08004',
+    '08006',
+    '08007',
+    '57P01',
+    '57P03',
+    '55006',
+  ])),
+  
+  PERMANENT_SQLSTATES: Object.freeze(new Set([
+    '42601',
+    '42P01',
+    '42P07',
+    '42P06',
+    '42701',
+    '42710',
+    '42723',
+    '42501',
+    '23505',
+    '23503',
+    '23514',
+    '23502',
+    '53100',
+    '53200',
+    '54000',
+  ])),
+});
+
 export function isValidRiskLevel(level) {
   return RISK_LEVEL_ORDER.includes(level);
 }
@@ -94,4 +135,43 @@ export function mapExecutorStatusToDb(executorStatus) {
     'rolled_back': 'rolled_back',
   };
   return mapping[executorStatus] || 'failed';
+}
+
+/**
+ * Compute backoff delay for retry attempts.
+ * Uses exponential backoff: 1s → 2s → 4s → 8s (capped at max).
+ * @param {number} attempt - Current attempt number (1-indexed)
+ * @param {Object} options - Override defaults from RETRY_CONFIG
+ * @returns {number} Backoff delay in milliseconds
+ */
+export function computeBackoff(attempt, options = {}) {
+  const config = { ...RETRY_CONFIG, ...options };
+  const backoff = config.INITIAL_BACKOFF_MS * Math.pow(config.BACKOFF_MULTIPLIER, attempt - 1);
+  return Math.min(backoff, config.MAX_BACKOFF_MS);
+}
+
+/**
+ * Check if a SQLSTATE code represents a transient (retryable) error.
+ * @param {string} sqlState - 5-character PostgreSQL error code
+ * @returns {boolean}
+ */
+export function isTransientError(sqlState) {
+  if (!sqlState) return false;
+  if (RETRY_CONFIG.TRANSIENT_SQLSTATES.has(sqlState)) return true;
+  
+  const prefix = sqlState.substring(0, 2);
+  return prefix === '08' || prefix === '58';
+}
+
+/**
+ * Check if a SQLSTATE code represents a permanent (non-retryable) error.
+ * @param {string} sqlState - 5-character PostgreSQL error code
+ * @returns {boolean}
+ */
+export function isPermanentError(sqlState) {
+  if (!sqlState) return false;
+  if (RETRY_CONFIG.PERMANENT_SQLSTATES.has(sqlState)) return true;
+  
+  const prefix = sqlState.substring(0, 2);
+  return ['42', '23', '53', '54'].includes(prefix);
 }

@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - DDL Generator
+ * https://schemaweaver.vivekmind.com/
+ */
 import { generateCreateSql } from './create-generator.js';
 import { generateAlterSql } from './alter-generator.js';
 import { generateDropSql } from './drop-generator.js';
@@ -34,6 +38,8 @@ export class DdlGenerator {
 
       if (change.sql) {
         sql = change.sql;
+      } else if (change.ddlStrategy === 'ALTER_TYPE_ADD_VALUE') {
+        sql = generateAlterSql(change);
       } else if (change.requiresRecreation || changeType === 'PARTITION_STRUCTURE_CHANGE') {
         const beforeObj = change.before || change.currentValue;
         const afterObj = change.after || change.desiredValue;

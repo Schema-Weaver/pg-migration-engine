@@ -1,6 +1,6 @@
 /**
- * Behavioral Applier - Apply behavioral changes after structural changes
- * Order: Functions → Views → Materialized Views → Triggers → Policies → Rules → Event Triggers
+ * Schema Weaver Migration Engine - Behavioral DDL
+ * https://schemaweaver.vivekmind.com/
  */
 
 export class BehavioralApplier {

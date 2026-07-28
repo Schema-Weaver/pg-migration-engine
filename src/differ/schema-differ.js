@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Differ
+ * https://schemaweaver.vivekmind.com/
+ */
 import crypto from 'crypto';
 import { ObjectMatcher } from './object-matcher.js';
 import { PropertyDiffer } from './property-differ.js';
@@ -14,7 +18,7 @@ export class SchemaDiffer {
   constructor(options = {}) {
     this.pgVersion = options.pgVersion || 150000;
     this.objectMatcher = new ObjectMatcher();
-    this.propertyDiffer = new PropertyDiffer();
+    this.propertyDiffer = new PropertyDiffer(this.pgVersion);
     this.dependencyResolver = new DependencyResolver();
     this.changeClassifier = new ChangeClassifier();
     this.riskTagger = new RiskTagger(this.pgVersion);
@@ -28,6 +32,38 @@ export class SchemaDiffer {
    */
   diff(desired, current) {
     const startTime = Date.now();
+
+    // Early exit for identical schemas
+    if (desired.checksum && current.checksum && desired.checksum === current.checksum) {
+      return {
+        summary: {
+          totalChanges: 0,
+          creates: 0,
+          drops: 0,
+          alters: 0,
+          renames: 0,
+          recreates: 0,
+          replaces: 0,
+          byTrack: { track1: { count: 0, phases: {} }, track2: { count: 0, phases: {} } },
+          byPhase: {},
+          byObjectType: {},
+          riskSummary: { critical: 0, high: 0, medium: 0, low: 0, none: 0, categories: {} },
+          requiresDowntime: false,
+          estimatedDuration: '0 seconds',
+        },
+        changes: [],
+        warnings: [],
+        dependencyGraph: { nodes: [], edges: [] },
+        metadata: {
+          diffDuration: Date.now() - startTime,
+          pgVersion: this.pgVersion,
+          desiredChecksum: desired.checksum,
+          currentChecksum: current.checksum,
+          earlyExit: true,
+        },
+      };
+    }
+
     const allChanges = [];
 
     // Step 1: Match objects between snapshots
@@ -117,16 +153,88 @@ export class SchemaDiffer {
    * Create a standardized change object.
    */
   createChangeObject(changeType, objectType, objectKey, before, after, extra = {}, property = null) {
-    const id = `change_${crypto.randomUUID().slice(0, 8)}`;
+    const safeObjectKey = (objectKey || '').replace(/[^a-zA-Z0-9_.]/g, '_');
+    const id = `${changeType.toLowerCase()}_${objectType}_${safeObjectKey}`;
+    const parts = (objectKey || '').split('.');
+    const name = extra?.name || parts[parts.length - 1] || '';
+
+    let schema = extra?.schema || (parts.length > 1 ? parts[0] : undefined);
+    let tableName = extra?.tableName;
+    let columnName = extra?.columnName;
+    let constraintName = extra?.constraintName;
+    let indexName = extra?.indexName;
+    let viewName = extra?.viewName;
+    let functionName = extra?.functionName;
+    let triggerName = extra?.triggerName;
+
+    if (objectType === 'column') {
+      if (parts.length >= 3) {
+        schema = parts[0];
+        tableName = parts[1];
+        columnName = parts[2];
+      } else if (parts.length === 2) {
+        tableName = parts[0];
+        columnName = parts[1];
+      }
+    } else if (objectType === 'constraint') {
+      if (parts.length >= 3) {
+        schema = parts[0];
+        tableName = parts[1];
+        constraintName = parts[2];
+      } else {
+        constraintName = name;
+      }
+    } else if (objectType === 'table') {
+      tableName = name;
+    } else if (objectType === 'index') {
+      indexName = name;
+      if (parts.length >= 2) tableName = parts[0];
+    } else if (objectType === 'view' || objectType === 'materializedView') {
+      viewName = name;
+    } else if (objectType === 'function' || objectType === 'procedure' || objectType === 'aggregate') {
+      functionName = name;
+    } else if (objectType === 'trigger') {
+      triggerName = name;
+      if (parts.length >= 3) tableName = parts[1];
+    }
+
+    let typePrefix = changeType === 'CREATE' ? 'add' : changeType === 'DROP' ? 'drop' : changeType === 'ALTER' ? 'alter' : changeType === 'RENAME' ? 'rename' : changeType;
+    let typeSuffix = objectType.charAt(0).toUpperCase() + objectType.slice(1);
+    let type = `${typePrefix}${typeSuffix}`;
+
+    if (objectType === 'index') {
+      if (changeType === 'CREATE') type = 'createIndex';
+      if (changeType === 'DROP') type = 'dropIndex';
+    }
+
+    let normalizedChangeType = changeType;
+    if (type.startsWith('add') || type.startsWith('create')) {
+      normalizedChangeType = 'CREATE';
+    } else if (type.startsWith('drop')) {
+      normalizedChangeType = 'DROP';
+    } else if (type.startsWith('rename')) {
+      normalizedChangeType = 'RENAME';
+    }
+
+    const deferrable = extra?.deferrable ?? after?.deferrable ?? after?.isDeferrable ?? before?.deferrable;
 
     return {
       id,
-      changeType,
+      type,
+      changeType: normalizedChangeType,
       objectType,
       objectKey,
-      schema: extra?.schema,
-      name: extra?.name || objectKey?.split('.').pop(),
+      schema,
+      name,
+      tableName,
+      columnName,
+      constraintName,
+      indexName,
+      viewName,
+      functionName,
+      triggerName,
       property,
+      deferrable,
       before: before || null,
       after: after || null,
       track: extra?.track || 1,
@@ -180,13 +288,15 @@ export class SchemaDiffer {
     };
 
     for (const change of changes) {
+      const ct = (change.changeType || change.type || '').toUpperCase();
+      const t = (change.type || '').toLowerCase();
       // Count by change type
-      if (change.changeType === 'CREATE') summary.creates++;
-      else if (change.changeType === 'DROP') summary.drops++;
-      else if (change.changeType === 'ALTER') summary.alters++;
-      else if (change.changeType === 'RENAME') summary.renames++;
-      else if (change.changeType?.includes('RECREATE')) summary.recreates++;
-      else if (change.changeType?.includes('REPLACE')) summary.replaces++;
+      if (ct.includes('CREATE') || ct.includes('ADD') || t.startsWith('add') || t.startsWith('create')) summary.creates++;
+      else if (ct.includes('DROP') || t.startsWith('drop')) summary.drops++;
+      else if (ct.includes('ALTER') || t.startsWith('alter')) summary.alters++;
+      else if (ct.includes('RENAME') || t.startsWith('rename')) summary.renames++;
+      else if (ct.includes('RECREATE')) summary.recreates++;
+      else if (ct.includes('REPLACE')) summary.replaces++;
 
       // Count by track
       const track = change.track === 2 ? 'track2' : 'track1';

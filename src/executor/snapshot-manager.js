@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Migration Executor
+ * https://schemaweaver.vivekmind.com/
+ */
 export class SnapshotManager {
   /**
    * @param {import('../introspection/index.js').SchemaIntrospector} introspector

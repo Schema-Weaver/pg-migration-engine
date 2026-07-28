@@ -1,17 +1,6 @@
 /**
- * @typedef {Object} MigrationPlan
- * @property {string} id
- * @property {string} name
- * @property {string} [description]
- * @property {string} createdAt
- * @property {string} sourceChecksum
- * @property {string} targetChecksum
- * @property {import('./changes.js').SchemaChange[]} changes
- * @property {MigrationStep[]} steps
- * @property {import('./risk.js').RiskAssessment} riskAssessment
- * @property {number} [estimatedDurationMs]
- * @property {boolean} isReversible
- * @property {MigrationPlan} [reversePlan]
+ * Schema Weaver Migration Engine - Type Definitions
+ * https://schemaweaver.vivekmind.com/
  */
 
 /**

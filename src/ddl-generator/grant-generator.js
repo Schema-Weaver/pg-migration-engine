@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - DDL Generator
+ * https://schemaweaver.vivekmind.com/
+ */
 function ident(name) {
   if (!name) return '';
   if (name.includes('"') || name.includes(' ')) {

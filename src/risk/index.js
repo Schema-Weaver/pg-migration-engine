@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Risk Engine
+ * https://schemaweaver.vivekmind.com/
+ */
 export { RiskEngine } from './risk-engine.js';
 export { checkDestructive } from './destructive-checker.js';
 export { checkDataLoss } from './data-loss-checker.js';

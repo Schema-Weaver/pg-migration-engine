@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const EXTENSIONS_QUERY = `
 SELECT e.extname AS name,
        n.nspname AS schema,

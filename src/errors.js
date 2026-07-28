@@ -1,6 +1,6 @@
 /**
- * Custom error types for the Schema Weaver Migration Engine.
- * All errors extend the base MigrationError class.
+ * Schema Weaver Migration Engine - Core
+ * https://schemaweaver.vivekmind.com/
  */
 
 export class MigrationError extends Error {
@@ -143,5 +143,70 @@ export class RecoveryError extends MigrationError {
     super(message, details);
     this.name = 'RecoveryError';
     this.recoverySteps = details?.recoverySteps || [];
+  }
+}
+
+export class UnsupportedFeatureError extends MigrationError {
+  constructor(message, details) {
+    super(message, details);
+    this.name = 'UnsupportedFeatureError';
+    this.feature = details?.feature;
+    this.pgVersion = details?.pgVersion;
+    this.requiredVersion = details?.requiredVersion;
+  }
+}
+
+export class ConnectionError extends MigrationError {
+  constructor(message, details) {
+    super(message, details);
+    this.name = 'ConnectionError';
+    this.host = details?.host;
+    this.port = details?.port;
+    this.code = details?.code;
+  }
+}
+
+export class EngineInternalError extends MigrationError {
+  constructor(message, details) {
+    super(message, details);
+    this.name = 'EngineInternalError';
+    this.component = details?.component;
+    this.operation = details?.operation;
+  }
+}
+
+export class InputValidationError extends MigrationError {
+  constructor(message, details) {
+    super(message, details);
+    this.name = 'InputValidationError';
+    this.expected = details?.expected;
+    this.actual = details?.actual;
+  }
+}
+
+export class ConfigurationError extends MigrationError {
+  constructor(message, details) {
+    super(message, details);
+    this.name = 'ConfigurationError';
+    this.missing = details?.missing || [];
+  }
+}
+
+export class AtlasError extends MigrationError {
+  constructor(message, details) {
+    super(message, details);
+    this.name = 'AtlasError';
+    this.exitCode = details?.exitCode;
+    this.stderr = details?.stderr;
+  }
+}
+
+export class DestructiveChangeError extends MigrationError {
+  constructor(message, details) {
+    super(message, details);
+    this.name = 'DestructiveChangeError';
+    this.warnings = details?.warnings || [];
+    this.warningReport = details?.warningReport || null;
+    this.dataLossAcknowledged = details?.dataLossAcknowledged || false;
   }
 }

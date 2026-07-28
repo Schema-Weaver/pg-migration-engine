@@ -1,6 +1,6 @@
 /**
- * Levenshtein distance implementation for rename detection.
- * Pure JS, zero dependencies.
+ * Schema Weaver Migration Engine - Schema Differ - Utilities
+ * https://schemaweaver.vivekmind.com/
  */
 
 /**

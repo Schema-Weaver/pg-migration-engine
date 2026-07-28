@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const TEXT_SEARCH_CONFIGS_QUERY = `
 SELECT
   t.oid,

@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const SCHEMAS_QUERY = `
 SELECT n.nspname AS name,
        n.nspowner::regrole::text AS owner,
@@ -20,7 +24,7 @@ SELECT c.oid,
        c.relrowsecurity AS rls_enabled,
        c.relforcerowsecurity AS rls_forced,
        c.reloptions AS storage_options,
-       CASE WHEN c.reltablespace != 0 THEN c.reltablespace::regrole::text ELSE NULL END AS tablespace,
+       CASE WHEN c.reltablespace != 0 THEN (SELECT spcname FROM pg_catalog.pg_tablespace WHERE oid = c.reltablespace) ELSE NULL END AS tablespace,
        CASE WHEN c.relkind = 'p' THEN pt.partstrat ELSE NULL END AS partition_strategy,
        pg_catalog.pg_get_expr(c.relpartbound, c.oid) AS partition_bound,
        c.relreplident AS replica_identity,

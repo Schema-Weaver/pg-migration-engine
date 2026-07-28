@@ -1,5 +1,6 @@
 /**
- * Generate ALTER DDL for property changes.
+ * Schema Weaver Migration Engine - DDL Generator
+ * https://schemaweaver.vivekmind.com/
  */
 
 export function generateAlterSql(change) {
@@ -240,9 +241,50 @@ function generateAlterTableSql(change) {
       const method = value !== undefined && value !== null ? value : change.after?.accessMethod;
       return `ALTER TABLE ${tableKey} SET ACCESS METHOD ${ident(method)};`;
     }
+    
+    case 'mergePartitions':
+      return generateMergePartitionsSql(change, tableKey);
+    
+    case 'splitPartition':
+      return generateSplitPartitionSql(change, tableKey);
+    
     default:
       return `-- Unsupported table property: ${property}`;
   }
+}
+
+function generateMergePartitionsSql(change, tableKey) {
+  const pgVersion = change.pgVersion || change.metadata?.pgVersion || 150000;
+  if (pgVersion < 190000) {
+    return `-- WARNING: MERGE PARTITIONS requires PostgreSQL 19+.\\n-- Table: ${tableKey}`;
+  }
+  const partitions = change.desiredValue?.partitions || change.desiredValue || [];
+  const targetPartition = change.desiredValue?.target || change.desiredValue?.into;
+  if (!targetPartition) {
+    return `-- ERROR: MERGE PARTITIONS requires target partition name`;
+  }
+  const partitionRefs = partitions.map(p => ident(p)).join(', ');
+  return `ALTER TABLE ${tableKey} MERGE PARTITIONS ${partitionRefs} INTO ${ident(targetPartition)};`;
+}
+
+function generateSplitPartitionSql(change, tableKey) {
+  const pgVersion = change.pgVersion || change.metadata?.pgVersion || 150000;
+  if (pgVersion < 190000) {
+    return `-- WARNING: SPLIT PARTITION requires PostgreSQL 19+.\\n-- Table: ${tableKey}`;
+  }
+  const sourcePartition = change.desiredValue?.source || change.desiredValue?.partition;
+  const intoPartitions = change.desiredValue?.into || change.desiredValue?.partitions || [];
+  if (!sourcePartition) {
+    return `-- ERROR: SPLIT PARTITION requires source partition name`;
+  }
+  const intoRefs = intoPartitions.map(p => {
+    let ref = ident(p.name);
+    if (p.bound) {
+      ref += ` FOR VALUES ${p.bound}`;
+    }
+    return ref;
+  }).join(', ');
+  return `ALTER TABLE ${tableKey} SPLIT PARTITION ${ident(sourcePartition)} INTO (${intoRefs});`;
 }
 
 function generateAlterColumnSql(change) {
@@ -266,7 +308,8 @@ function generateAlterColumnSql(change) {
       if (change.desiredValue === null || change.desiredValue === undefined) {
         return `ALTER TABLE ${table} ALTER COLUMN ${ident(col)} DROP DEFAULT;`;
       }
-      return `ALTER TABLE ${table} ALTER COLUMN ${ident(col)} SET DEFAULT ${change.desiredValue};`;
+      // SECURITY: Use escapeDefaultValue to prevent SQL injection
+      return `ALTER TABLE ${table} ALTER COLUMN ${ident(col)} SET DEFAULT ${escapeDefaultValue(change.desiredValue)};`;
 
     case 'isIdentity':
       if (change.desiredValue) {
@@ -340,6 +383,7 @@ function generateAlterColumnSql(change) {
       return `ALTER TABLE ${table} ALTER COLUMN ${ident(col)} SET STORAGE ${change.desiredValue.toUpperCase()};`;
 
     case 'statistics':
+    case 'statisticsTarget':
       if (change.desiredValue === null || change.desiredValue === undefined || change.desiredValue === -1) {
         return `ALTER TABLE ${table} ALTER COLUMN ${ident(col)} RESET STATISTICS;`;
       }
@@ -391,14 +435,34 @@ function generateAlterConstraintSql(change) {
       const idxName = con.indexName || `${conName}_idx`;
       return `ALTER INDEX ${idxName} SET TABLESPACE ${ident(change.desiredValue)};`;
 
+    case 'enforced':
+    case 'isEnforced':
+      return generateAlterConstraintEnforcedSql(change, tableKey, conName, con);
+
     default:
-      // Exclusion constraint specific
       if (con.constraintType === 'EXCLUSION' || con.type === 'EXCLUSION') {
         return `-- Exclusion constraint modification requires recreation: ${change.property}`;
       }
       return `-- Constraint modification requires recreation: ${change.property}`;
   }
   return '';
+}
+
+function generateAlterConstraintEnforcedSql(change, tableKey, conName, con) {
+  const constraintType = con.constraintType || con.type;
+  const pgVersion = change.pgVersion || change.metadata?.pgVersion || 150000;
+  const isPg19 = pgVersion >= 190000;
+  
+  if (constraintType === 'CHECK' || constraintType === 'FOREIGN KEY' || constraintType === 'FOREIGN_KEY') {
+    if (!change.desiredValue) {
+      if (constraintType === 'CHECK' && !isPg19) {
+        return `-- WARNING: ALTER CONSTRAINT NOT ENFORCED for CHECK constraints requires PostgreSQL 19+.\\n-- Constraint: ${conName}`;
+      }
+      return `ALTER TABLE ${tableKey} ALTER CONSTRAINT ${ident(conName)} NOT ENFORCED;`;
+    }
+    return `ALTER TABLE ${tableKey} ALTER CONSTRAINT ${ident(conName)} ENFORCED;`;
+  }
+  return `-- ENFORCED property not supported for constraint type: ${constraintType}`;
 }
 
 function generateAlterIndexSql(change) {
@@ -493,6 +557,11 @@ function generateAlterSequenceSql(change) {
       }
       return `COMMENT ON SEQUENCE ${seqKey} IS '${escapeString(change.desiredValue)}';`;
     case 'ownedBy': {
+      // Skip OWNED BY changes for identity sequences - PostgreSQL manages these automatically
+      // and cannot ALTER OWNED BY on identity sequences
+      if (change.before?.ownedBy || change.object?.ownedBy) {
+        return `-- Skipping OWNED BY change for identity sequence ${seqKey} (managed by PostgreSQL)`;
+      }
       if (change.desiredValue === null || change.desiredValue === undefined || change.desiredValue === 'NONE') {
         return `ALTER SEQUENCE ${seqKey} OWNED BY NONE;`;
       }
@@ -581,26 +650,46 @@ function generateAlterTypeSql(change) {
   if (property === 'enumValues' || property === 'labels') {
     const beforeList = change.before?.labels || change.before?.enumValues || [];
     const afterList = change.after?.labels || change.after?.enumValues || [];
+    const existingValues = change.existingEnumValues || change.before?.existingEnumValues || [];
     const stmts = [];
 
-    if (beforeList.length > 0 && afterList.length > 0) {
-      const removedLabels = beforeList.filter(l => !afterList.includes(l));
-      const addedLabels = afterList.filter(l => !beforeList.includes(l));
+    const normalizeValue = (v) => typeof v === 'object' ? v.value : v;
+    const normalizedBefore = beforeList.map(normalizeValue);
+    const normalizedAfter = afterList.map(normalizeValue);
+    const normalizedExisting = existingValues.map(normalizeValue);
 
-      if (removedLabels.length === 1 && addedLabels.length === 1) {
-        stmts.push(`ALTER TYPE ${typeKey} RENAME VALUE '${removedLabels[0]}' TO '${addedLabels[0]}';`);
+    if (beforeList.length > 0 && afterList.length > 0) {
+      const removedLabels = normalizedBefore.filter(l => !normalizedAfter.includes(l));
+      const addedLabels = normalizedAfter.filter(l => !normalizedBefore.includes(l));
+
+      const trulyAdded = addedLabels.filter(l => !normalizedExisting.includes(l));
+
+      if (removedLabels.length === 1 && trulyAdded.length === 1) {
+        const pgVersion = change.pgVersion || change.metadata?.pgVersion || 150000;
+        if (pgVersion >= 160000) {
+          stmts.push(`ALTER TYPE ${typeKey} RENAME VALUE '${removedLabels[0]}' TO '${trulyAdded[0]}';`);
+        } else {
+          stmts.push(`-- WARNING: ALTER TYPE ... RENAME VALUE requires PostgreSQL 16+.\n-- Would rename '${removedLabels[0]}' to '${trulyAdded[0]}'.`);
+          if (!normalizedExisting.includes(trulyAdded[0])) {
+            stmts.push(`ALTER TYPE ${typeKey} ADD VALUE '${trulyAdded[0]}';`);
+          }
+        }
       } else {
-        for (const val of addedLabels) {
-          const newIdx = afterList.indexOf(val);
+        for (const val of trulyAdded) {
+          if (normalizedExisting.includes(val)) {
+            stmts.push(`-- Skipping ADD VALUE '${val}' - already exists in enum`);
+            continue;
+          }
+          const newIdx = normalizedAfter.indexOf(val);
           let posClause = '';
           if (newIdx > 0) {
-            const prevLabel = afterList[newIdx - 1];
-            if (beforeList.includes(prevLabel)) {
+            const prevLabel = normalizedAfter[newIdx - 1];
+            if (normalizedBefore.includes(prevLabel) || normalizedExisting.includes(prevLabel)) {
               posClause = ` AFTER '${prevLabel}'`;
             }
-          } else if (newIdx === 0 && afterList.length > 1) {
-            const nextLabel = afterList[1];
-            if (beforeList.includes(nextLabel)) {
+          } else if (newIdx === 0 && normalizedAfter.length > 1) {
+            const nextLabel = normalizedAfter[1];
+            if (normalizedBefore.includes(nextLabel) || normalizedExisting.includes(nextLabel)) {
               posClause = ` BEFORE '${nextLabel}'`;
             }
           }
@@ -611,10 +700,14 @@ function generateAlterTypeSql(change) {
         }
       }
     } else {
-      const added = change.desiredValue?.added || [];
-      const removed = change.desiredValue?.removed || [];
+      const added = (change.desiredValue?.added || []).map(normalizeValue);
+      const removed = (change.desiredValue?.removed || []).map(normalizeValue);
       if (added.length > 0) {
         for (const val of added) {
+          if (normalizedExisting.includes(val)) {
+            stmts.push(`-- Skipping ADD VALUE '${val}' - already exists in enum`);
+            continue;
+          }
           stmts.push(`ALTER TYPE ${typeKey} ADD VALUE '${val}';`);
         }
       }
@@ -747,15 +840,65 @@ function generateGenericAlterSql(change) {
 function ident(name) {
   if (!name) return '';
   if (typeof name !== 'string') name = String(name);
-  if (name.includes('"') || name.includes(' ')) {
-    return `"${name.replace(/"/g, '""')}"`;
+  
+  // Validation: PostgreSQL identifier max length is 63 characters
+  if (name.length > 63) {
+    console.warn(
+      `[Security] Identifier "${name.substring(0, 30)}..." (${name.length} chars) exceeds PostgreSQL limit of 63. ` +
+      `PostgreSQL will truncate to "${name.substring(0, 63)}".`
+    );
   }
-  return `"${name}"`;
+  
+  // Always double-quote identifiers
+  return `"${name.replace(/"/g, '""')}"`;
 }
 
 function escapeString(str) {
   if (typeof str !== 'string') str = String(str);
   return str.replace(/'/g, "''");
+}
+
+/**
+ * Escape a default value for safe inclusion in DDL.
+ * SECURITY: This function prevents SQL injection in DEFAULT clauses.
+ */
+function escapeDefaultValue(defaultVal) {
+  if (defaultVal === null || defaultVal === undefined) return 'NULL';
+  
+  const str = String(defaultVal).trim();
+  if (str === '') return "''";
+  if (str.toUpperCase() === 'NULL') return 'NULL';
+  
+  // Check if it's already dollar-quoted
+  if (str.startsWith('$$') && str.endsWith('$$')) {
+    return str;
+  }
+  
+  // Check if it's already single-quoted
+  if (str.startsWith("'") && str.endsWith("'")) {
+    const inner = str.slice(1, -1);
+    return `'${inner.replace(/'/g, "''")}'`;
+  }
+  
+  // PostgreSQL keywords/functions that should not be quoted
+  const noQuoteKeywords = [
+    'TRUE', 'FALSE',
+    'NOW()', 'CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_TIME',
+    'CURRENT_USER', 'SESSION_USER', 'CURRENT_SCHEMA',
+    'GEN_RANDOM_UUID()', 'UUID_GENERATE_V4()'
+  ];
+  
+  if (noQuoteKeywords.includes(str.toUpperCase())) {
+    return str;
+  }
+  
+  // Numbers should not be quoted
+  if (/^-?\d+(\.\d+)?$/.test(str)) {
+    return str;
+  }
+  
+  // Default: treat as string literal
+  return `'${str.replace(/'/g, "''")}'`;
 }
 
 function generateAlterDefaultPrivilegesSql(change) {

@@ -1,4 +1,10 @@
+/**
+ * Schema Weaver Migration Engine - Schema Differ
+ * https://schemaweaver.vivekmind.com/
+ */
 import { getCastInfo, isSafeCast, isWideningCast } from './utils/type-compatibility.js';
+
+const PG_VERSION_17 = 170000;
 
 /**
  * Property Differ - Deep property-level diffing for all object types.
@@ -6,8 +12,19 @@ import { getCastInfo, isSafeCast, isWideningCast } from './utils/type-compatibil
  */
 
 export class PropertyDiffer {
-  constructor() {
+  constructor(pgVersion = 150000) {
     this.warnings = [];
+    this.pgVersion = pgVersion;
+  }
+
+  /**
+   * Filter out MAINTAIN privilege for PG < 17.
+   * @param {Array} privileges
+   * @returns {Array}
+   */
+  filterPrivileges(privileges) {
+    if (this.pgVersion >= PG_VERSION_17) return privileges;
+    return (privileges || []).filter(p => p.privilege !== 'MAINTAIN');
   }
 
   /**
@@ -233,8 +250,8 @@ export class PropertyDiffer {
     }
 
     // 4. Privileges (Grants & Revokes)
-    const curPrivs = current.privileges || [];
-    const desPrivs = desired.privileges || [];
+    const curPrivs = this.filterPrivileges(current.privileges);
+    const desPrivs = this.filterPrivileges(desired.privileges);
     const findPriv = (list, p) => list.find(x => x.privilege === p.privilege && x.grantee === p.grantee && x.isGrantable === p.isGrantable);
     
     const grantsToMake = [];
@@ -300,7 +317,7 @@ export class PropertyDiffer {
     ];
 
     for (const prop of props) {
-      if (JSON.stringify(desired[prop.name]) !== JSON.stringify(current[prop.name]) && desired[prop.name] !== undefined) {
+      if (JSON.stringify(desired[prop.name]) !== JSON.stringify(current[prop.name]) && (desired[prop.name] !== undefined || current[prop.name] !== undefined)) {
         changes.push(this.createPropertyChange('column', key, prop.name, current[prop.name], desired[prop.name]));
       }
     }
@@ -659,13 +676,17 @@ export class PropertyDiffer {
         const added = desiredNormalized.filter(dv => !currentNormalized.includes(dv));
         const removed = currentNormalized.filter(cv => !desiredNormalized.includes(cv));
 
-        changes.push(this.createPropertyChange('type', key, 'enumValues', { added: [], removed }, { added, removed }));
+        const change = this.createPropertyChange('type', key, 'enumValues', { added: [], removed }, { added, removed });
+        change.existingEnumValues = currentNormalized;
+        change.before = { ...change.before, existingEnumValues: currentNormalized };
+        changes.push(change);
 
         if (removed.length > 0) {
           changes[changes.length - 1].changeType = 'REMOVE_ENUM_VALUES';
           changes[changes.length - 1].requiresRecreation = true;
-        } else if (added.length > 0) {
+        } else         if (added.length > 0) {
           changes[changes.length - 1].changeType = 'ADD_ENUM_VALUES';
+          changes[changes.length - 1].addedValues = true;
         }
       }
 
@@ -757,6 +778,15 @@ export class PropertyDiffer {
 
   diffEventTrigger(desired, current, key) {
     const changes = [];
+
+    if (desired.event === 'login' && this.pgVersion < PG_VERSION_17) {
+      this.warnings.push({
+        code: 'LOGIN_EVENT_TRIGGER_UNSUPPORTED',
+        message: `Login event trigger "${desired.name}" requires PostgreSQL 17+ (current: ${Math.floor(this.pgVersion / 10000)})`,
+        objectKey: key,
+      });
+      return changes;
+    }
 
     const props = [
       'event',

@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const DEFAULT_PRIVILEGES_QUERY = `
 SELECT
   n.nspname AS schema,

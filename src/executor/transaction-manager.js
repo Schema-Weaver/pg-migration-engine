@@ -1,5 +1,6 @@
 /**
- * Transaction Manager - Handles transaction execution with proper error handling
+ * Schema Weaver Migration Engine - Migration Executor
+ * https://schemaweaver.vivekmind.com/
  */
 
 export class TransactionManager {

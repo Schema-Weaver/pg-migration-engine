@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Migration Storage
+ * https://schemaweaver.vivekmind.com/
+ */
 export class InMemoryStorageProvider {
   constructor() {
     this.snapshots = new Map();

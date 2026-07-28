@@ -1,6 +1,11 @@
+/**
+ * Schema Weaver Migration Engine - Schema Differ
+ * https://schemaweaver.vivekmind.com/
+ */
 import { similarity, isSimilarEnough } from './utils/levenshtein.js';
 import { sameTypeFamily, typesEqual, isImplicitCast } from './utils/type-compatibility.js';
 import { buildPath } from './utils/path-builder.js';
+import { InputValidationError } from '../errors.js';
 
 /**
  * Object matcher handles matching objects between two snapshots
@@ -24,6 +29,12 @@ export class ObjectMatcher {
    * @returns {Object} Match result with creates, drops, matches, and renames
    */
   match(desired, current) {
+    if (!desired || !current) {
+      throw new InputValidationError(
+        'match() requires both desired and current schema snapshots',
+        { expected: 'desired=<Object>, current=<Object>', actual: `desired=${typeof desired}, current=${typeof current}`, method: 'ObjectMatcher.match' }
+      );
+    }
     const result = {
       matches: [],        // Objects that exist in both (same key)
       creates: [],        // Objects only in desired
@@ -131,6 +142,10 @@ export class ObjectMatcher {
     // Find drops (in current but not in desired)
     for (const key of currentKeys) {
       if (!desiredKeys.has(key)) {
+        // Skip identity sequences - they are automatically dropped when the owning column is dropped
+        if (objectType === 'sequence' && currentMap[key]?.ownedBy) {
+          continue;
+        }
         result.drops.push({
           key,
           objectType,
@@ -151,8 +166,6 @@ export class ObjectMatcher {
     const createsByType = this.groupBy(result.creates, 'objectType');
 
     const detectedRenames = [];
-    
-    console.log('\n[RENAME DETECTION] Analyzing potential renames:');
 
     for (const [objectType, drops] of Object.entries(dropsByType)) {
       const creates = createsByType[objectType] || [];
@@ -166,10 +179,7 @@ export class ObjectMatcher {
 
           if (rename.confidence >= LOW_CONFIDENCE_THRESHOLD) {
             detectedRenames.push(rename);
-            
-            console.log(`  ✓ Detected: ${drop.name} → ${candidate.name}`);
-            console.log(`    Type: ${objectType}, Confidence: ${(rename.confidence * 100).toFixed(1)}% (${rename.confidenceLevel})`);
-            
+
             result.creates = result.creates.filter(c => c.key !== candidate.key);
             result.drops = result.drops.filter(d => d.key !== drop.key);
           }
@@ -178,16 +188,15 @@ export class ObjectMatcher {
             candidate: c,
             score: this.computeRenameScore(drop, c, desired, current)
           })).sort((a, b) => b.score - a.score);
-          
+
           const best = sortedCandidates[0];
           const rename = this.createRenameChange(drop, best.candidate, objectType);
-          
+
           const isHighConfidence = best.score >= HIGH_CONFIDENCE_THRESHOLD;
-          
+
           if (isHighConfidence) {
             detectedRenames.push(rename);
-            console.log(`  ✓ Best match: ${drop.name} → ${best.candidate.name} (${(best.score * 100).toFixed(1)}%) among ${candidates.length} candidates`);
-            
+
             result.creates = result.creates.filter(c => c.key !== best.candidate.key);
             result.drops = result.drops.filter(d => d.key !== drop.key);
           } else {
@@ -195,19 +204,10 @@ export class ObjectMatcher {
             rename.candidates = candidates;
             rename.warnings = [`Multiple rename candidates detected. Best match: "${best.candidate.name}" (confidence: ${rename.confidence.toFixed(2)})`];
             detectedRenames.push(rename);
-            
-            console.log(`  ? Ambiguous: ${drop.name} has ${candidates.length} candidates:`);
-            sortedCandidates.slice(0, 3).forEach(c => {
-              console.log(`      - ${c.candidate.name} (${(c.score * 100).toFixed(1)}%)`);
-            });
           }
-        } else {
-          console.log(`  ✗ No match found for: ${drop.name} (${objectType})`);
         }
       }
     }
-    
-    console.log(`[RENAME DETECTION] Total detected: ${detectedRenames.length}\n`);
 
     result.renames = detectedRenames;
   }
@@ -232,6 +232,13 @@ export class ObjectMatcher {
       // Type compatibility check (for columns and types)
       if (!this.typesCompatible(drop, create, desired, current)) return false;
 
+      // Structural compatibility check for indexes:
+      // Reject index renames when columns don't meaningfully overlap
+      if (drop.objectType === 'index' && drop.object && create.object) {
+        const structScore = this.computeStructuralSimilarity(drop.object, create.object);
+        if (structScore < 0.50) return false;
+      }
+
       return true;
     });
   }
@@ -252,6 +259,9 @@ export class ObjectMatcher {
       newKey: create.key,
       oldName: drop.name,
       newName: create.name,
+      renameFrom: drop.name,
+      renameTo: create.name,
+      isRename: true,
       changeType: 'RENAME',
       similarity: nameSimilarity,
       confidence,
@@ -310,7 +320,7 @@ export class ObjectMatcher {
       score += 0.20;
     }
 
-    if ((drop.objectType === 'table' || drop.objectType === 'column') && drop.object && create.object) {
+    if ((drop.objectType === 'table' || drop.objectType === 'column' || drop.objectType === 'index') && drop.object && create.object) {
       const structuralSimilarity = this.computeStructuralSimilarity(drop.object, create.object);
       score += 0.20 * structuralSimilarity;
     }
@@ -429,6 +439,23 @@ export class ObjectMatcher {
       }
       const total = Math.max(colsA.size, colsB.size);
       return total > 0 ? shared / total : 0;
+    }
+
+    // For indexes
+    if (objA.isUnique !== undefined || objA.method !== undefined || objA.columns !== undefined) {
+      let score = 0;
+      if (objA.columns && objB.columns) {
+        const exprA = objA.columns.map(c => c.expression || c.column_name || '').filter(Boolean);
+        const exprB = objB.columns.map(c => c.expression || c.column_name || '').filter(Boolean);
+        let shared = 0;
+        for (const e of exprB) { if (exprA.includes(e)) shared++; }
+        const total = Math.max(exprA.length, exprB.length);
+        score += total > 0 ? shared / total : 0;
+      }
+      if (objA.isUnique === objB.isUnique) score += 0.25;
+      if (objA.method === objB.method) score += 0.15;
+      if ((objA.whereClause || objA.condition || objA.predicate) === (objB.whereClause || objB.condition || objB.predicate)) score += 0.15;
+      return Math.min(score, 1);
     }
 
     return 0;

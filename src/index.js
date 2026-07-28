@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Core
+ * https://schemaweaver.vivekmind.com/
+ */
 import { SchemaIntrospector } from './introspection/index.js';
 import { SchemaDiffer } from './differ/index.js';
 import { MigrationPlanner } from './planner/index.js';
@@ -10,6 +14,7 @@ import { BehavioralApplier } from './behavioral/behavioral-applier.js';
 import { DdlGenerator } from './ddl-generator/index.js';
 import { RiskEngine } from './risk/index.js';
 import { InMemoryStorageProvider } from './storage/index.js';
+import { CrashRecovery } from './recovery/index.js';
 import {
   MigrationError,
   ExecutionError,
@@ -28,6 +33,7 @@ import {
   StorageError,
   PlanBlockedError,
   RecoveryError,
+  DestructiveChangeError,
 } from './errors.js';
 
 export {
@@ -43,6 +49,7 @@ export {
   MigrationTable,
   RollbackGenerator,
   InMemoryStorageProvider,
+  CrashRecovery,
   MigrationError,
   ExecutionError,
   IntrospectionError,
@@ -60,6 +67,7 @@ export {
   StorageError,
   PlanBlockedError,
   RecoveryError,
+  DestructiveChangeError,
 };
 
 import { RISK_LEVELS, RISK_LEVEL_ORDER, mapExecutorStatusToDb } from './constants.js';
@@ -74,6 +82,10 @@ import { RISK_LEVELS, RISK_LEVEL_ORDER, mapExecutorStatusToDb } from './constant
  * @property {boolean} [verifyAfter=true]
  * @property {string} [connectionId] - Database connection ID for multi-DB support
  * @property {'none'|'low'|'medium'|'high'|'critical'} [allowRiskBelow] - Only allow migrations below this risk level
+ * @property {boolean} [acceptDataLoss=false] - Auto-approve destructive changes without prompting
+ * @property {boolean} [warningsEnabled=true] - Enable/disable destructive change warnings
+ * @property {boolean} [interactive=true] - Enable interactive prompts (set false for CI/CD)
+ * @property {boolean} [cloneDryRun=false] - Enable clone dry-run before execution (tests DDL on ephemeral schema with copied data)
  */
 
 export class SwMigrationEngine {
@@ -90,6 +102,9 @@ export class SwMigrationEngine {
       verifyAfter: true,
       connectionId: config.connectionId || null,
       allowRiskBelow: 'critical',
+      acceptDataLoss: false,
+      warningsEnabled: true,
+      interactive: true,
       ...config,
     };
 
@@ -178,7 +193,7 @@ export class SwMigrationEngine {
     const hasCritical = (plan.summary?.riskSummary?.critical || 0) > 0;
     const hasHigh = (plan.summary?.riskSummary?.high || 0) > 0;
 
-    if (hasCritical && maxAllowedIdx <= riskOrder.indexOf('critical')) {
+    if (hasCritical && maxAllowedIdx < riskOrder.indexOf('critical')) {
       plan.blocked = true;
       plan.blockReason = `Migration blocked: ${plan.summary.riskSummary.critical} critical risk(s) detected.`;
     } else if (hasHigh && maxAllowedIdx < riskOrder.indexOf('high')) {
@@ -305,6 +320,9 @@ export class SwMigrationEngine {
     }
 
     const execOptions = { ...options, connectionId };
+    const acceptDataLoss = options.acceptDataLoss || this.config.acceptDataLoss;
+    const warningsEnabled = options.warningsEnabled !== undefined ? options.warningsEnabled : this.config.warningsEnabled;
+    const interactive = options.interactive !== undefined ? options.interactive : this.config.interactive;
 
     if (options.dryRun) {
       const dryRunResult = await this.dryRun(usePool, plan, execOptions);
@@ -316,11 +334,91 @@ export class SwMigrationEngine {
       };
     }
 
+    if (warningsEnabled) {
+      const { DestructiveWarningIntegrator } = await import(
+        '../sw-migration-engine_tests/destructive-change-warnings/implementation/planner-warning-integration.js'
+      );
+      const { ExecutorWarningPrompt } = await import(
+        '../sw-migration-engine_tests/destructive-change-warnings/implementation/executor-warning-prompt.js'
+      );
+      const { CliWarningDisplay } = await import(
+        '../sw-migration-engine_tests/destructive-change-warnings/implementation/cli-warning-display.js'
+      );
+
+      const integrator = new DestructiveWarningIntegrator();
+      integrator.setPool(usePool);
+      const report = await integrator.generateWarningReport(plan, options);
+
+      const prompt = new ExecutorWarningPrompt({
+        acceptDataLoss,
+        force: options.force || false,
+        dryRun: false,
+        interactive,
+        outputStream: process.stdout,
+      });
+
+      if (report.hasDestructiveChanges) {
+        const display = new CliWarningDisplay();
+        if (acceptDataLoss) {
+          display.outputStream.write(display.formatAutoProceed(report) + '\n');
+        } else {
+          display.outputStream.write(display.formatReport(report, options) + '\n');
+        }
+
+        const resolution = await prompt.resolve(report);
+        if (!resolution.proceed) {
+          if (!acceptDataLoss && !options.force) {
+            const display2 = new CliWarningDisplay();
+            display2.outputStream.write(display2.formatCancelled() + '\n');
+          }
+          return {
+            success: false,
+            status: 'cancelled',
+            message: resolution.message,
+            warningReport: report,
+            plan,
+            diff,
+            executedSteps: [],
+          };
+        }
+
+        execOptions.warningReport = report;
+        execOptions.warningsAcknowledged = resolution.acknowledged;
+        execOptions.dataLossAcknowledged = resolution.acknowledged.some(w => w.level === 'data_loss');
+      }
+    }
+
+    if (options.cloneDryRun || this.config.cloneDryRun) {
+      const { CloneDryRunner } = await import(
+        '../sw-migration-engine_tests/destructive-change-warnings/implementation/clone-dry-runner.js'
+      );
+      const runner = new CloneDryRunner(usePool);
+      try {
+        const cloneReport = await runner.run(plan, execOptions);
+        execOptions.cloneReport = cloneReport;
+        if (!cloneReport.safeToProceed) {
+          return {
+            success: false,
+            status: 'clone_dry_run_failed',
+            message: `Clone dry-run failed: ${cloneReport.errors.map(e => e.detail).join('; ')}`,
+            cloneReport,
+            plan,
+            diff,
+            executedSteps: [],
+          };
+        }
+      } finally {
+        await runner.cleanup();
+      }
+    }
+
     const result = await this.execute(usePool, plan, execOptions);
     return {
       ...result,
       plan,
       diff,
+      warningReport: result.warningReport || null,
+      cloneReport: execOptions.cloneReport || null,
     };
   }
 
@@ -441,6 +539,48 @@ export class SwMigrationEngine {
   }
 
   /**
+   * Reconcile incomplete migrations after crash
+   * @param {import('pg').Pool} [pool]
+   * @param {Object} [options]
+   * @returns {Promise<Object>}
+   */
+  async reconcile(pool, options = {}) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const connectionId = options.connectionId || this.config.connectionId || null;
+    const storage = new MigrationTable(usePool, connectionId);
+    await storage.ensureTable();
+
+    const introspector = new SchemaIntrospector(usePool);
+    const recovery = new CrashRecovery(usePool, introspector, storage);
+
+    return recovery.reconcile(connectionId);
+  }
+
+  /**
+   * Get incomplete migrations count
+   * @param {import('pg').Pool} [pool]
+   * @param {Object} [options]
+   * @returns {Promise<number>}
+   */
+  async getIncompleteCount(pool, options = {}) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const connectionId = options.connectionId || this.config.connectionId || null;
+    const storage = new MigrationTable(usePool, connectionId);
+    await storage.ensureTable();
+
+    const running = await storage.getByStatus(connectionId, 'running');
+    return running.length;
+  }
+
+  /**
    * Validate a desired schema against PG version constraints
    * @param {import('./types/schema.js').SchemaSnapshot} desired
    * @param {number} pgVersion
@@ -477,7 +617,168 @@ export class SwMigrationEngine {
    * @param {Object} current
    * @returns {import('./types/changes.js').SchemaDiff}
    */
-  diffSchemas(desired, current) {
+diffSchemas(desired, current) {
     return this.diff(desired, current);
+  }
+
+  async detectDrift(pool, options = {}) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const connectionId = options.connectionId || this.config.connectionId || null;
+    const storage = new MigrationTable(usePool, connectionId);
+    await storage.ensureTable();
+
+    const lastMigration = await storage.getLastMigration(connectionId, true);
+
+    if (!lastMigration?.snapshot_after) {
+      return {
+        canDetect: false,
+        reason: 'no_baseline',
+        message: 'No previous migration snapshot found. Cannot detect drift.',
+      };
+    }
+
+    let expectedSnapshot;
+    try {
+      expectedSnapshot = typeof lastMigration.snapshot_after === 'string' 
+        ? JSON.parse(lastMigration.snapshot_after) 
+        : lastMigration.snapshot_after;
+    } catch (e) {
+      return {
+        canDetect: false,
+        reason: 'invalid_snapshot',
+        message: 'Could not parse baseline snapshot.',
+      };
+    }
+
+    const { DriftDetector } = await import('./executor/drift-detector.js');
+    const driftDetector = new DriftDetector();
+
+    const introspector = new SchemaIntrospector(usePool);
+    const currentSnapshot = await this.captureDriftSnapshot(usePool);
+
+    const drift = driftDetector.detect(expectedSnapshot, currentSnapshot, { changes: [] });
+
+    return {
+      canDetect: true,
+      driftDetected: drift.detected,
+      summary: drift.summary,
+      unexpectedChanges: drift.unexpectedChanges,
+      missingChanges: drift.missingChanges,
+      baselineMigration: {
+        id: lastMigration.id,
+        version: lastMigration.version,
+        appliedAt: lastMigration.applied_at
+      },
+      currentSnapshot,
+    };
+  }
+
+  async captureDriftSnapshot(pool) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const result = await usePool.query(`
+      SELECT
+        n.nspname as schema,
+        c.relname as name,
+        c.relkind as kind,
+        md5(n.nspname || '.'::text || c.relname || '.'::text || c.relkind::text) as checksum
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+        AND n.nspname NOT LIKE 'pg_temp_%'
+      ORDER BY n.nspname, c.relname
+    `);
+
+    return {
+      timestamp: new Date().toISOString(),
+      objectCount: result.rows.length,
+      checksums: result.rows.map(r => ({
+        schema: r.schema,
+        name: r.name,
+        kind: r.kind,
+        checksum: r.checksum,
+      })),
+    };
+  }
+
+  async reconcileDrift(pool, options = {}) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const connectionId = options.connectionId || this.config.connectionId || null;
+    const driftResult = await this.detectDrift(usePool, { connectionId });
+
+    if (!driftResult.canDetect) {
+      return {
+        reconciled: false,
+        reason: driftResult.reason,
+        message: driftResult.message,
+      };
+    }
+
+    if (!driftResult.driftDetected) {
+      return {
+        reconciled: false,
+        reason: 'no_drift',
+        message: 'No drift detected. Schema is consistent.',
+      };
+    }
+
+    if (!options.auto && options.confirm !== true) {
+      return {
+        reconciled: false,
+        requiresConfirmation: true,
+        drift: driftResult,
+        message: `Drift detected: ${driftResult.summary.objectsCreated || 0} created, ` +
+          `${driftResult.summary.objectsDropped || 0} dropped, ` +
+          `${driftResult.summary.objectsModified || 0} modified. ` +
+          `Set auto: true or confirm: true to reconcile.`,
+      };
+    }
+
+    const storage = new MigrationTable(usePool, connectionId);
+    await storage.ensureTable();
+
+    const currentSnapshot = await this.captureDriftSnapshot(usePool);
+    const expectedSnapshot = driftResult.currentSnapshot;
+
+    const reconciliationRecord = await storage.insertReconciliationRecord({
+      connectionId,
+      name: 'drift_reconciliation',
+      snapshotBefore: expectedSnapshot,
+      snapshotAfter: currentSnapshot,
+      driftSummary: driftResult.summary,
+      schemaDiff: { drift: driftResult },
+    });
+
+    return {
+      reconciled: true,
+      reconciliationId: reconciliationRecord.id,
+      version: reconciliationRecord.version,
+      driftSummary: driftResult.summary,
+      message: 'Drift reconciled. Current schema state recorded in history.',
+    };
+  }
+
+  async verifyHistoryIntegrity(pool, options = {}) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const connectionId = options.connectionId || this.config.connectionId || null;
+    const storage = new MigrationTable(usePool, connectionId);
+    await storage.ensureTable();
+
+    return storage.verifyHistoryIntegrity(connectionId);
   }
 }

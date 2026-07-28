@@ -1,4 +1,11 @@
-const PUBLICATIONS_QUERY = `
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
+const PG_VERSION_19 = 190000;
+const PG_VERSION_15 = 150000;
+
+const PUBLICATIONS_QUERY_PG19 = `
 SELECT
   p.oid,
   p.pubname AS name,
@@ -9,6 +16,24 @@ SELECT
   p.pubdelete AS delete,
   p.pubtruncate AS truncate,
   p.pubviaroot AS via_root,
+  p.puballsequences AS all_sequences,
+  pg_catalog.obj_description(p.oid, 'pg_publication') AS comment
+FROM pg_catalog.pg_publication p
+ORDER BY p.pubname
+`;
+
+const PUBLICATIONS_QUERY_PRE_PG19 = `
+SELECT
+  p.oid,
+  p.pubname AS name,
+  pg_catalog.pg_get_userbyid(p.pubowner) AS owner,
+  p.puballtables AS all_tables,
+  p.pubinsert AS insert,
+  p.pubupdate AS update,
+  p.pubdelete AS delete,
+  p.pubtruncate AS truncate,
+  p.pubviaroot AS via_root,
+  false AS all_sequences,
   pg_catalog.obj_description(p.oid, 'pg_publication') AS comment
 FROM pg_catalog.pg_publication p
 ORDER BY p.pubname
@@ -48,15 +73,18 @@ export async function queryPublications(pool, version) {
   if (version < 100000) return [];
 
   try {
-    const pubsResult = await pool.query(PUBLICATIONS_QUERY);
+    const publicationsQuery = version >= PG_VERSION_19 
+      ? PUBLICATIONS_QUERY_PG19 
+      : PUBLICATIONS_QUERY_PRE_PG19;
+    
+    const pubsResult = await pool.query(publicationsQuery);
     const tablesResult = await pool.query(PUBLICATION_TABLES_QUERY);
     
     let schemasResult = { rows: [] };
-    if (version >= 150000) {
+    if (version >= PG_VERSION_15) {
       try {
         schemasResult = await pool.query(PUBLICATION_SCHEMAS_QUERY);
       } catch (e) {
-        // pg_publication_namespace doesn't exist before PG15
       }
     }
 
@@ -72,6 +100,7 @@ export async function queryPublications(pool, version) {
         delete: row.delete,
         truncate: row.truncate,
         via_root: row.via_root,
+        all_sequences: row.all_sequences || false,
         comment: row.comment,
         tables: [],
         schemas: [],
@@ -88,7 +117,6 @@ export async function queryPublications(pool, version) {
           tableEntry.rowFilter = row.row_filter;
         }
         if (row.column_attnums) {
-          // Parse column attnums to get column names from the table
           try {
             const attnums = row.column_attnums;
             if (attnums && attnums.length > 0) {

@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Migration Planner
+ * https://schemaweaver.vivekmind.com/
+ */
 export { MigrationPlanner } from './migration-planner.js';
 export { SmartMigrator } from './smart-migrator.js';
 export { BackfillPlanner } from './backfill-planner.js';

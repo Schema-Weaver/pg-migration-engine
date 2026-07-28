@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const TABLE_COMMENTS_QUERY = `
 SELECT n.nspname || '.' || c.relname AS object_key,
        pg_catalog.obj_description(c.oid, 'pg_class') AS comment

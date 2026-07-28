@@ -1,5 +1,6 @@
 /**
- * Risk tagger - assesses and tags every change with risk information.
+ * Schema Weaver Migration Engine - Schema Differ
+ * https://schemaweaver.vivekmind.com/
  */
 
 import { isWideningCast, isSafeCast } from './utils/type-compatibility.js';
@@ -262,13 +263,16 @@ export class RiskTagger {
    */
   isCriticalRisk(change) {
     if (change.changeType === 'DROP' || change.changeType?.startsWith('DROP')) {
-      if (change.objectType === 'table' && change.hasData === true) {
+      if (change.objectType === 'table') {
         return true;
       }
-      if (change.objectType === 'column' && change.isReferenced === true) {
+      if (change.objectType === 'column') {
         return true;
       }
-      if (change.objectType === 'type' && change.isUsed === true) {
+      if (change.objectType === 'type') {
+        return true;
+      }
+      if (change.objectType === 'domain') {
         return true;
       }
     }
@@ -285,6 +289,10 @@ export class RiskTagger {
       if (info && info.dataLossRisk === 'critical') {
         return true;
       }
+    }
+    
+    if (change.changeType === 'TRUNCATE') {
+      return true;
     }
     
     return false;
@@ -317,6 +325,18 @@ export class RiskTagger {
       if (change.objectType === 'view' || change.objectType === 'materializedView') {
         return true;
       }
+      if (change.objectType === 'domain') {
+        return true;
+      }
+      if (change.objectType === 'foreignDataWrapper' || change.objectType === 'foreignTable') {
+        return true;
+      }
+      if (change.objectType === 'schema') {
+        return true;
+      }
+      if (change.objectType === 'extension') {
+        return true;
+      }
     }
     
     if (change.changeType?.includes('RECREATE') && change.requiresRecreation) {
@@ -335,6 +355,11 @@ export class RiskTagger {
       if (!isConcurrent) {
         return true;
       }
+    }
+    
+    if (change.changeType === 'ALTER' && change.objectType === 'table' &&
+        change.changedProperties?.includes('schema')) {
+      return true;
     }
     
     return false;
@@ -364,6 +389,12 @@ export class RiskTagger {
       if (change.objectType === 'foreignServer' || change.objectType === 'foreignTable') {
         return true;
       }
+      if (change.objectType === 'language') {
+        return true;
+      }
+      if (change.objectType === 'cast') {
+        return true;
+      }
     }
     
     if (change.property === 'dataType') {
@@ -375,6 +406,15 @@ export class RiskTagger {
     }
     
     if (change.changeType === 'ALTER' && change.objectType === 'function') {
+      return true;
+    }
+    
+    if (change.changeType === 'ALTER' && change.objectType === 'table' &&
+        change.changedProperties?.includes('owner')) {
+      return true;
+    }
+    
+    if (change.changeType === 'ALTER' && change.objectType === 'schema') {
       return true;
     }
     
@@ -480,6 +520,12 @@ export class RiskTagger {
     if (change.changeType === 'REMOVE_ENUM_VALUES') {
       return `Removing enum values will require DROP + CREATE type, affecting all columns using it`;
     }
+    if (change.objectType === 'domain' && change.changeType === 'DROP') {
+      return `Dropping domain ${change.objectKey} will cascade to all columns using it`;
+    }
+    if (change.changeType === 'TRUNCATE') {
+      return `TRUNCATE ${change.objectKey} will permanently delete all data in the table`;
+    }
     return 'This change may cause irreversible data loss';
   }
 
@@ -499,6 +545,22 @@ export class RiskTagger {
     if (change.property === 'dataType') {
       return `Type change ${change.currentValue} → ${change.desiredValue} may truncate data`;
     }
+    if (change.objectType === 'schema' && change.changeType === 'DROP') {
+      return `Dropping schema ${change.objectKey} will cascade to all objects within it`;
+    }
+    if (change.objectType === 'extension' && change.changeType === 'DROP') {
+      return `Dropping extension ${change.objectKey} removes dependent functionality`;
+    }
+    if (change.objectType === 'foreignDataWrapper' || change.objectType === 'foreignTable') {
+      return `Dropping ${change.objectType} ${change.objectKey} removes external data access`;
+    }
+    if (change.objectType === 'domain' && change.changeType === 'DROP') {
+      return `Dropping domain ${change.objectKey} cascades to all columns using it`;
+    }
+    if (change.changeType === 'ALTER' && change.objectType === 'table' &&
+        change.changedProperties?.includes('schema')) {
+      return `Moving table ${change.objectKey} between schemas breaks existing references`;
+    }
     return 'This change may impact data integrity';
   }
 
@@ -517,6 +579,24 @@ export class RiskTagger {
     }
     if (change.objectType === 'index' && change.changeType === 'DROP') {
       return `Dropping index ${change.objectKey} concurrently is safer but slower`;
+    }
+    if (change.objectType === 'language' && change.changeType === 'DROP') {
+      return `Dropping language ${change.objectKey} removes procedural language support`;
+    }
+    if (change.objectType === 'cast' && change.changeType === 'DROP') {
+      return `Dropping cast ${change.objectKey} removes type conversion behavior`;
+    }
+    if (change.objectType === 'publication' || change.objectType === 'subscription') {
+      return `Dropping ${change.objectType} ${change.objectKey} affects logical replication`;
+    }
+    if (change.objectType === 'foreignServer') {
+      return `Dropping foreign server ${change.objectKey} breaks foreign table access`;
+    }
+    if (change.changeType === 'ALTER' && change.objectType === 'schema') {
+      return `Altering schema ${change.objectKey} may affect namespace resolution`;
+    }
+    if (change.property === 'isNullable' && change.desiredValue === false) {
+      return `Setting NOT NULL on ${change.objectKey} may cause validation failures on existing rows`;
     }
     return 'This change may have unintended side effects';
   }

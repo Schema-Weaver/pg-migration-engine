@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
 const TRIGGERS_QUERY = `
 SELECT t.tgname AS name,
        n.nspname AS schema,
@@ -44,6 +48,7 @@ JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
 JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
   AND n.nspname NOT LIKE 'pg_temp_%'
+  AND NOT t.tgisinternal
 ORDER BY tn.nspname, c.relname, t.tgname
 `;
 

@@ -1,50 +1,6 @@
 /**
- * SchemaSnapshot - Complete representation of a PostgreSQL database schema
- * @typedef {Object} SchemaSnapshot
- * @property {{numeric:number,major:number,string:string}} version
- * @property {string} timestamp
- * @property {string} checksum
- * @property {DatabaseInfo} [database]
- * @property {Record<string, SchemaInfo>} schemas
- * @property {Record<string, TableInfo>} tables
- * @property {Record<string, ViewInfo>} views
- * @property {Record<string, MaterializedViewInfo>} materializedViews
- * @property {Record<string, IndexInfo>} indexes
- * @property {Record<string, FunctionInfo>} functions
- * @property {Record<string, ProcedureInfo>} procedures
- * @property {Record<string, AggregateInfo>} aggregates
- * @property {Record<string, TriggerInfo>} triggers
- * @property {Record<string, EventTriggerInfo>} eventTriggers
- * @property {Record<string, TypeInfo>} types
- * @property {Record<string, SequenceInfo>} sequences
- * @property {Record<string, ExtensionInfo>} extensions
- * @property {Record<string, PolicyInfo>} policies
- * @property {Record<string, ConstraintInfo>} constraints
- * @property {Record<string, string>} comments
- * @property {GrantInfo[]} grants
- * @property {Record<string, StatisticsInfo>} statistics
- * @property {Record<string, CollationInfo>} collations
- * @property {Record<string, ConversionInfo>} conversions
- * @property {Record<string, OperatorInfo>} operators
- * @property {Record<string, OperatorClassInfo>} operatorClasses
- * @property {Record<string, OperatorFamilyInfo>} operatorFamilies
- * @property {Record<string, TextSearchConfigInfo>} textSearchConfigs
- * @property {Record<string, TextSearchDictInfo>} textSearchDictionaries
- * @property {Record<string, TextSearchParserInfo>} textSearchParsers
- * @property {Record<string, TextSearchTemplateInfo>} textSearchTemplates
- * @property {Record<string, ForeignDataWrapperInfo>} foreignDataWrappers
- * @property {Record<string, ForeignServerInfo>} foreignServers
- * @property {Record<string, UserMappingInfo>} userMappings
- * @property {Record<string, CastInfo>} casts
- * @property {Record<string, RuleInfo>} rules
- * @property {Record<string, RoleInfo>} roles
- * @property {Record<string, TablespaceInfo>} tablespaces
- * @property {Record<string, AccessMethodInfo>} accessMethods
- * @property {Record<string, LanguageInfo>} languages
- * @property {Record<string, DefaultPrivilegeInfo>} defaultPrivileges
- * @property {Record<string, DatabaseInfo>} databases
- * @property {Record<string, PublicationInfo>} publications
- * @property {Record<string, SubscriptionInfo>} subscriptions
+ * Schema Weaver Migration Engine - Type Definitions
+ * https://schemaweaver.vivekmind.com/
  */
 
 /**

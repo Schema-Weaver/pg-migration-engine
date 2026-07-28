@@ -1,7 +1,10 @@
 /**
- * PG18+ specific introspection queries.
- * Only called when detected PG version >= 18.
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
  */
+
+const PG_VERSION_18 = 180000;
+const PG_VERSION_19 = 190000;
 
 const PG18_NOT_ENFORCED_QUERY = `
 SELECT n.nspname AS schema,
@@ -30,14 +33,59 @@ WHERE a.attgenerated = 'v'
   AND n.nspname NOT LIKE 'pg_temp_%'
 `;
 
-/**
- * @param {import('pg').Pool} pool
- * @returns {Promise<{notEnforced:Array,virtualColumns:Array}>}
- */
+const PG19_NOT_ENFORCED_CHECK_QUERY = `
+SELECT n.nspname AS schema,
+       c.conname AS name,
+       c.conrelid::regclass::text AS table_ref,
+       c.contype AS constraint_type,
+       NOT c.conenforced AS not_enforced
+FROM pg_catalog.pg_constraint c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace
+WHERE c.conenforced = false
+  AND c.contype IN ('c', 'f')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_temp_%'
+`;
+
 export async function queryPg18Features(pool) {
   const [notEnforced, virtualColumns] = await Promise.all([
     pool.query(PG18_NOT_ENFORCED_QUERY).then(r => r.rows),
     pool.query(PG18_VIRTUAL_COLUMNS_QUERY).then(r => r.rows),
   ]);
   return { notEnforced, virtualColumns };
+}
+
+export async function queryPg19Features(pool, version) {
+  if (version < PG_VERSION_19) {
+    return { 
+      notEnforcedChecks: [],
+      propertyGraphs: [] 
+    };
+  }
+
+  const results = {
+    notEnforcedChecks: [],
+    propertyGraphs: [],
+  };
+
+  try {
+    results.notEnforcedChecks = await pool.query(PG19_NOT_ENFORCED_CHECK_QUERY).then(r => r.rows);
+  } catch (e) {
+  }
+
+  return results;
+}
+
+export function shouldQueryPropertyGraphs(version) {
+  return false;
+}
+
+export function getNotEnforcedConstraintTypes(version) {
+  if (version < PG_VERSION_18) {
+    return [];
+  }
+  if (version < PG_VERSION_19) {
+    return ['f'];
+  }
+  return ['c', 'f'];
 }

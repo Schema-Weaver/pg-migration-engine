@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Migration Executor
+ * https://schemaweaver.vivekmind.com/
+ */
 export class ProgressTracker {
   constructor() {
     this.progress = new Map();
@@ -69,6 +73,38 @@ export class ProgressTracker {
    */
   getEvents() {
     return this.events;
+  }
+
+  /**
+   * Emit a warning event
+   * @param {Object} warning - Warning details
+   * @param {'critical'|'high'|'medium'|'low'} warning.level - Warning severity
+   * @param {string} warning.type - Warning type (data_loss, destructive, behavioral, safety)
+   * @param {string} warning.message - Human-readable warning message
+   * @param {Array} [warning.changes] - Related changes triggering the warning
+   * @param {boolean} [warning.accepted=false] - Whether the warning was accepted
+   */
+  emitWarning(warning) {
+    this.emit({
+      type: 'warning',
+      subtype: 'destructive_change',
+      warning,
+    });
+  }
+
+  /**
+   * Emit a prompt event for interactive user input
+   * @param {Object} prompt - Prompt details
+   * @param {string} prompt.type - Prompt type (acknowledge, confirm, abort)
+   * @param {string} prompt.message - Prompt message
+   * @param {Array} [prompt.options] - Available response options
+   */
+  emitPrompt(prompt) {
+    this.emit({
+      type: 'prompt',
+      subtype: 'destructive_change',
+      prompt,
+    });
   }
 
   /**

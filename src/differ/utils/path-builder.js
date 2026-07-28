@@ -1,5 +1,6 @@
 /**
- * Utility for building dotted paths like "public.users.email"
+ * Schema Weaver Migration Engine - Schema Differ - Utilities
+ * https://schemaweaver.vivekmind.com/
  */
 
 /**

@@ -1,4 +1,8 @@
-const INDEXES_QUERY = `
+/**
+ * Schema Weaver Migration Engine - Schema Introspection - Catalog Queries
+ * https://schemaweaver.vivekmind.com/
+ */
+const INDEXES_QUERY_PG16 = `
 SELECT c.relname AS index_name,
        n.nspname AS schema,
        c.relname AS index_relname,
@@ -21,7 +25,48 @@ SELECT c.relname AS index_name,
        ix.indisclustered AS is_clustered,
        ix.indnkeyatts AS number_of_key_columns,
        ix.indoption AS column_options,
-       (SELECT (regexp_matches(unnest_opt, 'pages_per_range=(\d+)'))[1]::int
+       ix.indnullsnotdistinct AS nulls_not_distinct,
+       (SELECT (regexp_matches(unnest_opt, 'pages_per_range=(\\d+)'))[1]::int
+        FROM unnest(COALESCE(c.reloptions, ARRAY[]::text[])) AS unnest_opt
+        WHERE unnest_opt LIKE 'pages_per_range=%'
+        LIMIT 1
+       ) AS brin_pages_per_range
+FROM pg_catalog.pg_index ix
+JOIN pg_catalog.pg_class c ON c.oid = ix.indexrelid
+JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
+JOIN pg_catalog.pg_am am ON am.oid = c.relam
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+  AND n.nspname NOT LIKE 'pg_temp_%'
+ORDER BY tn.nspname, t.relname, c.relname
+`;
+
+const INDEXES_QUERY_PG15 = `
+SELECT c.relname AS index_name,
+       n.nspname AS schema,
+       c.relname AS index_relname,
+       t.relname AS table_name,
+       tn.nspname AS table_schema,
+       c.relowner::regrole::text AS owner,
+       ix.indisunique AS is_unique,
+       ix.indisprimary AS is_primary,
+       am.amname AS method,
+       ix.indkey AS column_indices,
+       pg_catalog.pg_get_indexdef(ix.indexrelid) AS definition,
+       CASE WHEN ix.indpred IS NOT NULL THEN pg_catalog.pg_get_expr(ix.indpred, ix.indrelid) ELSE NULL END AS where_clause,
+       CASE WHEN c.reltablespace != 0 THEN (SELECT spcname FROM pg_catalog.pg_tablespace WHERE oid = c.reltablespace) ELSE NULL END AS tablespace,
+       c.reloptions AS storage_options,
+       pg_catalog.obj_description(ix.indexrelid, 'pg_class') AS comment,
+       ix.indisvalid AS is_valid,
+       ix.indisready AS is_ready,
+       ix.indislive AS is_live,
+       ix.indisreplident AS is_replica_identity,
+       ix.indisclustered AS is_clustered,
+       ix.indnkeyatts AS number_of_key_columns,
+       ix.indoption AS column_options,
+       false AS nulls_not_distinct,
+       (SELECT (regexp_matches(unnest_opt, 'pages_per_range=(\\d+)'))[1]::int
         FROM unnest(COALESCE(c.reloptions, ARRAY[]::text[])) AS unnest_opt
         WHERE unnest_opt LIKE 'pages_per_range=%'
         LIMIT 1
@@ -82,10 +127,12 @@ ORDER BY n.nspname, c.relname, ik.ordinality
 
 /**
  * @param {import('pg').Pool} pool
+ * @param {number} [version]
  * @returns {Promise<Array>}
  */
-export async function queryIndexes(pool) {
-  const result = await pool.query(INDEXES_QUERY);
+export async function queryIndexes(pool, version = 150000) {
+  const query = version >= 160000 ? INDEXES_QUERY_PG16 : INDEXES_QUERY_PG15;
+  const result = await pool.query(query);
   return result.rows;
 }
 

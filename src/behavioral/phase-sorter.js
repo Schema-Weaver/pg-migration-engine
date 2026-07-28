@@ -1,3 +1,7 @@
+/**
+ * Schema Weaver Migration Engine - Behavioral DDL
+ * https://schemaweaver.vivekmind.com/
+ */
 export class PhaseSorter {
   /**
    * @param {Array<{type:string,phase:number,sql:string,name:string}>} items

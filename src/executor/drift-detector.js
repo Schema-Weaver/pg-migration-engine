@@ -1,5 +1,6 @@
 /**
- * Drift Detector - Detect schema drift during migration execution
+ * Schema Weaver Migration Engine - Migration Executor
+ * https://schemaweaver.vivekmind.com/
  */
 
 export class DriftDetector {
