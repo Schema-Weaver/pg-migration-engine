@@ -164,6 +164,111 @@ const result = await engine.migrate(pool, desired);
 
 ---
 
+## Schema Format
+
+The `desired` schema can be provided in two formats:
+
+### Object Format (Recommended)
+
+```javascript
+const desired = {
+  tables: {
+    'public.users': {
+      name: 'users',
+      schema: 'public',
+      columns: [
+        { name: 'id', dataType: 'serial', isNullable: false },
+        { name: 'email', dataType: 'varchar(255)', isNullable: false },
+        { name: 'created_at', dataType: 'timestamp', isNullable: false },
+      ],
+      constraints: [
+        { name: 'users_pkey', constraintType: 'PRIMARY_KEY', columns: ['id'] },
+        { name: 'users_email_unique', constraintType: 'UNIQUE', columns: ['email'] },
+      ],
+    },
+  },
+  types: {
+    'public.status': {
+      name: 'status',
+      schema: 'public',
+      kind: 'ENUM',
+      enumValues: ['draft', 'published', 'archived'],
+    },
+  },
+  indexes: {
+    'public.users_email_idx': {
+      name: 'users_email_idx',
+      schema: 'public',
+      table: 'users',
+      columns: [{ name: 'email' }],
+    },
+  },
+};
+```
+
+### Array Format (Auto-converted)
+
+```javascript
+// Arrays are automatically converted to object format
+const desired = {
+  tables: [
+    { name: 'users', columns: [{ name: 'id', type: 'serial' }] },
+  ],
+  types: [
+    { name: 'status', kind: 'ENUM', enumValues: ['active', 'inactive'] },
+  ],
+  indexes: [
+    { name: 'email_idx', table: 'users', columns: ['email'] }, // strings auto-converted
+  ],
+};
+```
+
+### Column Format
+
+Columns accept both `dataType` and `type`:
+
+```javascript
+// Both work:
+{ name: 'id', dataType: 'serial' }
+{ name: 'id', type: 'serial' }
+
+// Full example:
+{ 
+  name: 'created_at', 
+  dataType: 'timestamp', 
+  isNullable: false,
+  defaultValue: 'now()'
+}
+```
+
+### Index Columns
+
+Index columns can be strings or objects:
+
+```javascript
+// All work:
+columns: ['email', 'name']
+columns: [{ name: 'email' }, { name: 'name' }]
+columns: [{ expression: 'lower(email)' }]
+```
+
+### Normalization Helper
+
+```javascript
+import { normalizeSchema, validateSchemaFormat } from 'pg-migration-engine';
+
+// Normalize array format to object format
+const normalized = normalizeSchema(schema);
+
+// Validate schema format
+const { valid, errors } = validateSchemaFormat(schema);
+if (!valid) {
+  console.error('Schema errors:', errors);
+}
+```
+
+---
+
 ## Key Features
 
 ### 50+ PostgreSQL Object Types

@@ -251,8 +251,17 @@ function generateCreateColumnSql(change) {
   const colName = ident(parts.pop());
   const tableName = parts.map(ident).join('.');
   
+  const dataType = col.dataType || col.type;
+  if (!dataType) {
+    throw new Error(
+      `Column type is required for column "${col.name || colName}". ` +
+      `Provide either "dataType" or "type" property. ` +
+      `Example: { name: "created_at", dataType: "timestamp" }`
+    );
+  }
+  
   const ifNotExists = col.ifNotExists !== false ? 'IF NOT EXISTS ' : '';
-  let sql = `ALTER TABLE ${tableName} ADD COLUMN ${ifNotExists}${colName} ${col.dataType}`;
+  let sql = `ALTER TABLE ${tableName} ADD COLUMN ${ifNotExists}${colName} ${dataType}`;
   
   if (col.collation) {
     sql += ` COLLATE ${col.collation}`;
@@ -735,6 +744,9 @@ function generateCreateIndexSql(idx) {
     }
     
     const cols = (idx.columns || []).map(c => {
+      if (typeof c === 'string') {
+        return ident(c);
+      }
       let col = c.expression || ident(c.name);
       if (c.collation) col += ` COLLATE ${c.collation}`;
       if (c.opclass) col += ` ${c.opclass}`;

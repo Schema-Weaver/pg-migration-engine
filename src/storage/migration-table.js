@@ -8,6 +8,37 @@ const ENGINE_VERSION = '1.0.0';
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function toUUID(input) {
+  if (!input) return null;
+  if (UUID_REGEX.test(input)) {
+    return input;
+  }
+  if (typeof input === 'string') {
+    const hash = crypto.createHash('md5').update(input).digest('hex');
+    return `${hash.slice(0,8)}-${hash.slice(8,12)}-${hash.slice(12,16)}-${hash.slice(16,20)}-${hash.slice(20,32)}`;
+  }
+  return null;
+}
+
+function validateConnectionId(connectionId) {
+  if (!connectionId) return { valid: true, uuid: null, warning: null };
+  
+  if (UUID_REGEX.test(connectionId)) {
+    return { valid: true, uuid: connectionId, warning: null };
+  }
+  
+  const converted = toUUID(connectionId);
+  return {
+    valid: true,
+    uuid: converted,
+    warning: `connectionId "${connectionId}" is not a valid UUID. ` +
+             `Converted to "${converted}" for database storage. ` +
+             `For best results, use a valid UUID format.`,
+  };
+}
+
 async function retryWithBackoff(fn, maxRetries = MAX_RETRIES, delayMs = RETRY_DELAY_MS) {
   let lastError;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -44,7 +75,11 @@ export class MigrationTable {
 
   constructor(pool, connectionId = null) {
     this.pool = pool;
-    this.connectionId = connectionId;
+    const validation = validateConnectionId(connectionId);
+    this.connectionId = validation.uuid;
+    if (validation.warning) {
+      console.warn(`[MigrationTable] ${validation.warning}`);
+    }
     this._reconciledConnections = new Set();
 
     if (!connectionId) {

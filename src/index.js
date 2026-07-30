@@ -2,6 +2,7 @@
  * Schema Weaver Migration Engine - Core
  * https://schemaweaver.vivekmind.com/
  */
+import crypto from 'crypto';
 import { SchemaIntrospector } from './introspection/index.js';
 import { SchemaDiffer } from './differ/index.js';
 import { MigrationPlanner } from './planner/index.js';
@@ -35,6 +36,25 @@ import {
   RecoveryError,
   DestructiveChangeError,
 } from './errors.js';
+
+export {
+  DestructiveWarningIntegrator,
+  ExecutorWarningPrompt,
+  CliWarningDisplay,
+  CloneDryRunner,
+  DestructiveChangeClassifier,
+  DataImpactAnalyzer,
+  DataSampler,
+  WarningFormatter,
+} from './warnings/index.js';
+
+export {
+  normalizeSchema,
+  normalizeColumn,
+  normalizeIndex,
+  validateSchemaFormat,
+} from './validation/index.js';
+
 
 export {
   SchemaIntrospector,
@@ -109,10 +129,11 @@ export class SwMigrationEngine {
     };
 
     if (!this.config.connectionId) {
+      this.config.connectionId = `default-${crypto.randomUUID().slice(0, 8)}`;
       console.warn(
         '[SwMigrationEngine] No connectionId provided. ' +
-        'Migration records will not be scoped to a database. ' +
-        'This may cause issues in multi-database environments.'
+        `Auto-generated: "${this.config.connectionId}". ` +
+        'Set connectionId explicitly for multi-database support.'
       );
     }
 
@@ -271,6 +292,28 @@ export class SwMigrationEngine {
       throw new ExecutionError('Database pool is required. Call setPool() or pass pool to migrate().');
     }
 
+    if (desired === null || desired === undefined) {
+      throw new ValidationError(
+        'Schema (desired) is required and cannot be null or undefined. ' +
+        'Provide a valid schema object with at least: { tables: { ... } }'
+      );
+    }
+
+    if (typeof desired !== 'object' || Array.isArray(desired)) {
+      throw new ValidationError(
+        `Schema must be an object, got ${Array.isArray(desired) ? 'array' : typeof desired}. ` +
+        'Expected format: { tables: { "public.tablename": { ... } } }'
+      );
+    }
+
+    const { normalizeSchema } = await import('./validation/schema-normalizer.js');
+    let normalizedSchema = desired;
+    try {
+      normalizedSchema = normalizeSchema(desired);
+    } catch (normError) {
+      throw new ValidationError(`Schema normalization failed: ${normError.message}`);
+    }
+
     const connectionId = options.connectionId || this.config.connectionId || null;
     if (!connectionId) {
       console.warn(
@@ -281,7 +324,7 @@ export class SwMigrationEngine {
 
     const current = await this.introspect(usePool, options);
 
-    if (current.checksum === desired.checksum) {
+    if (current.checksum === normalizedSchema.checksum) {
       return {
         success: true,
         status: 'no_changes',
@@ -292,7 +335,7 @@ export class SwMigrationEngine {
       };
     }
 
-    const diff = this.diff(desired, current);
+    const diff = this.diff(normalizedSchema, current);
 
     if (diff.summary.totalChanges === 0) {
       return {
@@ -336,13 +379,13 @@ export class SwMigrationEngine {
 
     if (warningsEnabled) {
       const { DestructiveWarningIntegrator } = await import(
-        '../sw-migration-engine_tests/destructive-change-warnings/implementation/planner-warning-integration.js'
+        './warnings/planner-warning-integration.js'
       );
       const { ExecutorWarningPrompt } = await import(
-        '../sw-migration-engine_tests/destructive-change-warnings/implementation/executor-warning-prompt.js'
+        './warnings/executor-warning-prompt.js'
       );
       const { CliWarningDisplay } = await import(
-        '../sw-migration-engine_tests/destructive-change-warnings/implementation/cli-warning-display.js'
+        './warnings/cli-warning-display.js'
       );
 
       const integrator = new DestructiveWarningIntegrator();
@@ -390,7 +433,7 @@ export class SwMigrationEngine {
 
     if (options.cloneDryRun || this.config.cloneDryRun) {
       const { CloneDryRunner } = await import(
-        '../sw-migration-engine_tests/destructive-change-warnings/implementation/clone-dry-runner.js'
+        './warnings/clone-dry-runner.js'
       );
       const runner = new CloneDryRunner(usePool);
       try {

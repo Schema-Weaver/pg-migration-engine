@@ -481,8 +481,11 @@ export class MigrationExecutor {
         recovery: recoveryInfo,
       });
       const failedPhase = result.errors?.[0]?.step || this.executedSteps?.[this.executedSteps.length - 1];
+      const phaseNum = failedPhase?.phase || 0;
+      const phaseName = this.getPhaseName(phaseNum) || 'initialization';
+      const stepId = failedPhase?.stepId || 'unknown';
       throw new ExecutionError(
-        `Migration ${plan.id} failed at phase ${failedPhase?.phase || '?'} "${this.getPhaseName(failedPhase?.phase) || '?'}" step "${failedPhase?.stepId || '?'}"` +
+        `Migration ${plan.id} failed at phase ${phaseNum || '?'} "${phaseName}" step "${stepId}"` +
         `: ${error.message}${failedPhase?.sql ? `\nSQL: ${failedPhase.sql.substring(0, 300)}` : ''}`,
         { cause: error, recovery: recoveryInfo, result }
       );
