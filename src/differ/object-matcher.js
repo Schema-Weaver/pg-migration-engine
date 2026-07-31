@@ -5,6 +5,7 @@
 import { similarity, isSimilarEnough } from './utils/levenshtein.js';
 import { sameTypeFamily, typesEqual, isImplicitCast } from './utils/type-compatibility.js';
 import { buildPath } from './utils/path-builder.js';
+import { isInternalObjectKey } from './utils/internal-objects.js';
 import { InputValidationError } from '../errors.js';
 
 /**
@@ -111,7 +112,12 @@ export class ObjectMatcher {
    * Match objects of a specific type.
    */
   matchObjects(desiredMap, currentMap, objectType, result, desired, current) {
-    if (!desiredMap) desiredMap = {};
+    // A section absent from the desired snapshot means "no intent" for that
+    // object family - never turn a minimal desired schema into drops of
+    // everything the introspection reports (PK constraints, indexes, FKs,
+    // sequences, functions, ...). Only sections the user manages explicitly
+    // are diffed (with absent keys -> drops).
+    if (desiredMap === undefined || desiredMap === null) return;
     if (!currentMap) currentMap = {};
 
     const desiredKeys = new Set(Object.keys(desiredMap));
@@ -219,6 +225,14 @@ export class ObjectMatcher {
     return creates.filter(create => {
       // Must be same object type
       if (drop.objectType !== create.objectType) return false;
+
+      // Never pair engine bookkeeping objects (migration_history,
+      // migration_status, ...) with user objects as renames - the diff
+      // filters those objects out, so a rename would silently swallow the
+      // user's object (e.g. a user enum named "order_status" paired with the
+      // internal "migration_status" enum).
+      if (isInternalObjectKey(drop.objectType, drop.key)) return false;
+      if (isInternalObjectKey(create.objectType, create.key)) return false;
 
       // Must be in same schema
       if (drop.schema !== create.schema) return false;
@@ -469,6 +483,16 @@ export class ObjectMatcher {
     if (drop.object?.dataType && create.object?.dataType) {
       return sameTypeFamily(drop.object.dataType, create.object.dataType) ||
              isImplicitCast(drop.object.dataType, create.object.dataType);
+    }
+
+    // For user-defined types: an enum whose values differ is NOT a rename
+    // candidate - the value set is the type's content, and renaming an enum
+    // never changes its values.
+    if ((drop.objectType === 'type' || drop.objectType === 'domain' || drop.objectType === 'enum') &&
+        drop.object?.kind === 'ENUM' && create.object?.kind === 'ENUM') {
+      const dropValues = (drop.object.enumValues || drop.object.labels || []).join('\u0000');
+      const createValues = (create.object.enumValues || create.object.labels || []).join('\u0000');
+      return dropValues === createValues;
     }
 
     // For other object types, always consider compatible

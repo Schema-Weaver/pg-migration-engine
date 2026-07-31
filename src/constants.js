@@ -11,6 +11,12 @@ export const MIGRATION_STATUS = Object.freeze({
   DRY_RUN_FAILURE: 'DRY_RUN_FAILURE',
   RUNNING: 'RUNNING',
   PENDING: 'pending',
+  ACQUIRING_LOCK: 'acquiring_lock',
+  VERIFYING: 'verifying',
+  COMPLETING: 'completing',
+  STALE: 'stale',
+  ROLLING_BACK: 'rolling_back',
+  NEEDS_REVIEW: 'needs_review',
   NO_CHANGES: 'no_changes',
   BLOCKED: 'blocked',
 });
@@ -23,7 +29,13 @@ export const DB_STATUS = Object.freeze({
   DRY_RUN_FAILURE: 'dry_run_failure',
   RUNNING: 'running',
   PENDING: 'pending',
+  ACQUIRING_LOCK: 'acquiring_lock',
+  VERIFYING: 'verifying',
+  COMPLETING: 'completing',
+  STALE: 'stale',
+  ROLLING_BACK: 'rolling_back',
   ROLLED_BACK: 'rolled_back',
+  NEEDS_REVIEW: 'needs_review',
 });
 
 export const RISK_LEVELS = Object.freeze({
@@ -133,6 +145,12 @@ export function mapExecutorStatusToDb(executorStatus) {
     'running': 'running',
     'pending': 'pending',
     'rolled_back': 'rolled_back',
+    'acquiring_lock': 'acquiring_lock',
+    'verifying': 'verifying',
+    'completing': 'completing',
+    'stale': 'stale',
+    'rolling_back': 'rolling_back',
+    'needs_review': 'needs_review',
   };
   return mapping[executorStatus] || 'failed';
 }

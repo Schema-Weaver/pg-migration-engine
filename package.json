@@ -1,12 +1,12 @@
 {
   "name": "pg-migration-engine",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "PostgreSQL schema migration engine. Introspect, diff, generate DDL, and execute safe migrations for 50+ object types across PG10-18.",
   "license": "BSL-1.1",
   "author": "Schema Weaver",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Schema-Weaver/pg-migration-engine.git"
+    "url": "git+https://github.com/Schema-Weaver/pg-migration-engine.git"
   },
   "homepage": "https://schemaweaver.vivekmind.com",
   "bugs": {

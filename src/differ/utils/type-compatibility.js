@@ -15,8 +15,17 @@ export function normalizeType(type) {
   
   // Handle array types
   const isArray = lower.endsWith('[]');
-  const baseType = isArray ? lower.slice(0, -2) : lower;
-  
+  let baseType = isArray ? lower.slice(0, -2) : lower;
+
+  // Split off type parameters so aliases apply to parameterized types too:
+  // varchar(255) -> character varying(255), numeric(10,2), timestamp(3) ...
+  let params = '';
+  const parenIdx = baseType.indexOf('(');
+  if (parenIdx !== -1) {
+    params = baseType.slice(parenIdx);
+    baseType = baseType.slice(0, parenIdx).trim();
+  }
+
   // Normalize common aliases
   const aliases = {
     'int': 'integer',
@@ -30,6 +39,7 @@ export function normalizeType(type) {
     'float4': 'real',
     'float8': 'double precision',
     'double': 'double precision',
+    'decimal': 'numeric',
     'char': 'character',
     'varchar': 'character varying',
     'timestamp': 'timestamp without time zone',
@@ -38,7 +48,7 @@ export function normalizeType(type) {
     'timetz': 'time with time zone',
   };
   
-  const normalized = aliases[baseType] || baseType;
+  const normalized = (aliases[baseType] || baseType) + params;
   
   return isArray ? `${normalized}[]` : normalized;
 }
@@ -52,7 +62,9 @@ export function parseTypeParams(type) {
   const normalized = normalizeType(type);
   
   // Check for parameterized types: varchar(n), numeric(p,s), etc.
-  const match = normalized.match(/^([a-z_]+)\s*\(([^)]+)\)$/);
+  // Note the family regex allows spaces: "character varying(100)",
+  // "bit varying(8)", "timestamp with time zone".
+  const match = normalized.match(/^([a-z_ ]+)\s*\(([^)]+)\)$/);
   
   if (!match) {
     return { family: normalized, params: null };
@@ -247,23 +259,25 @@ export function getCastInfo(fromType, toType) {
     return getSameFamilyCastInfo(fromParsed, toParsed);
   }
   
-  // Check explicit cast matrix
-  const sourceCasts = CAST_MATRIX[from];
-  if (sourceCasts && sourceCasts[to]) {
-    return { exists: true, ...sourceCasts[to] };
+  // Check explicit cast matrix (keys are family names without parameters,
+  // so compare on the parsed families - e.g. "character varying(100)" maps
+  // to the "character varying" matrix entry).
+  const sourceCasts = CAST_MATRIX[fromParsed.family];
+  if (sourceCasts && sourceCasts[toParsed.family]) {
+    return { exists: true, ...sourceCasts[toParsed.family] };
   }
-  
+
   // Try reverse lookup for assignment casts
   // (Some types can be cast to even if not in the forward direction)
-  const targetCasts = CAST_MATRIX[to];
-  if (targetCasts && targetCasts[from]) {
+  const targetCasts = CAST_MATRIX[toParsed.family];
+  if (targetCasts && targetCasts[fromParsed.family]) {
     // Reverse the cast info
-    const info = targetCasts[from];
+    const info = targetCasts[fromParsed.family];
     return {
       exists: true,
       implicit: false, // Not implicit in reverse
       safe: info.safe,
-      using: info.using ? `::${to}` : null,
+      using: info.using ? `::${toParsed.family}` : null,
       dataLossRisk: info.dataLossRisk,
     };
   }
@@ -398,10 +412,9 @@ export function isWideningCast(fromType, toType) {
     ['json', 'jsonb'],
   ];
   
-  const from = normalizeType(fromType);
-  const to = normalizeType(toType);
-  
-  return wideningCasts.some(([f, t]) => f === from && t === to);
+  // Cross-family widening. Compare on families (parameters stripped) so
+  // "character varying(100)" matches the "character varying" -> text rule.
+  return wideningCasts.some(([f, t]) => f === fromParsed.family && t === toParsed.family);
 }
 
 /**

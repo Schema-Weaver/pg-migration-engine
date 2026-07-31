@@ -2,7 +2,7 @@
  * Schema Weaver Migration Engine - Schema Differ
  * https://schemaweaver.vivekmind.com/
  */
-import { getCastInfo, isSafeCast, isWideningCast } from './utils/type-compatibility.js';
+import { getCastInfo, isSafeCast, isWideningCast, typesEqual } from './utils/type-compatibility.js';
 
 const PG_VERSION_17 = 170000;
 
@@ -317,7 +317,20 @@ export class PropertyDiffer {
     ];
 
     for (const prop of props) {
-      if (JSON.stringify(desired[prop.name]) !== JSON.stringify(current[prop.name]) && (desired[prop.name] !== undefined || current[prop.name] !== undefined)) {
+      // Desired-driven diffing: a property that is absent from the desired
+      // column object means "no intent" for that property, so nothing is
+      // diffed. Introspection populates many props unconditionally (identity
+      // params, length, defaultValue ...) - comparing current-only values
+      // would produce spurious DROP IDENTITY / DROP DEFAULT / no-op ALTERs
+      // for minimal desired schemas. To remove something explicitly, set the
+      // prop to null in desired (e.g. defaultValue: null -> DROP DEFAULT).
+      if (desired[prop.name] === undefined) continue;
+      // dataType is compared via type normalization so aliases are equal
+      // (varchar(255) vs character varying(255), int vs integer, ...).
+      const differs = prop.name === 'dataType'
+        ? !typesEqual(desired[prop.name], current[prop.name])
+        : JSON.stringify(desired[prop.name]) !== JSON.stringify(current[prop.name]);
+      if (differs) {
         changes.push(this.createPropertyChange('column', key, prop.name, current[prop.name], desired[prop.name]));
       }
     }
@@ -363,7 +376,9 @@ export class PropertyDiffer {
           });
         }
       } else {
-        typeChange.changeType = 'SAFE_CAST';
+        typeChange.changeType = isWideningCast(typeChange.currentValue, typeChange.desiredValue)
+          ? 'WIDENING_CAST'
+          : 'SAFE_CAST';
       }
     }
 
@@ -374,7 +389,6 @@ export class PropertyDiffer {
     const changes = [];
 
     const props = [
-      'columns',
       'definition',
       'whereClause',
       'isUnique',
@@ -383,7 +397,6 @@ export class PropertyDiffer {
       'tablespace',
       'storageParameters',
       'method',
-      'includeColumns',
       'comment',
       'isValid',
       'isReady',
@@ -399,6 +412,28 @@ export class PropertyDiffer {
       if (JSON.stringify(desired[prop]) !== JSON.stringify(current[prop]) && desired[prop] !== undefined) {
         changes.push(this.createPropertyChange('index', key, prop, current[prop], desired[prop]));
       }
+    }
+
+    // Columns are compared in canonical form: the introspector emits
+    // { expression, direction, nullsOrder } while desired schemas commonly
+    // use { name } (e.g. [{ name: 'user_id' }]). Without normalization the
+    // index is recreated on every migration.
+    const normDirection = d => ((d ?? 'ASC') + '').replace(/^NULLS\s+/i, '').toUpperCase();
+    const normNulls = n => ((n ?? 'LAST') + '').replace(/^NULLS\s+/i, '').toUpperCase();
+    const normalizedColumns = cols => (Array.isArray(cols) ? cols.map(c => ({
+      expression: c?.expression ?? c?.name ?? c?.column_name ?? c,
+      direction: normDirection(c?.direction),
+      nullsOrder: normNulls(c?.nullsOrder),
+    })) : cols);
+    const normalizedIncludes = cols => (Array.isArray(cols)
+      ? cols.map(c => c?.name ?? c?.column_name ?? c)
+      : cols);
+
+    if (JSON.stringify(normalizedColumns(desired.columns)) !== JSON.stringify(normalizedColumns(current.columns))) {
+      changes.push(this.createPropertyChange('index', key, 'columns', current.columns, desired.columns));
+    }
+    if (JSON.stringify(normalizedIncludes(desired.includeColumns)) !== JSON.stringify(normalizedIncludes(current.includeColumns))) {
+      changes.push(this.createPropertyChange('index', key, 'includeColumns', current.includeColumns, desired.includeColumns));
     }
 
     // Definition changes require recreation

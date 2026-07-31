@@ -3,6 +3,8 @@
  * https://schemaweaver.vivekmind.com/
  */
 
+import { LockAcquisitionError } from '../errors.js';
+
 export class TransactionManager {
   /**
    * @param {import('pg').Pool} pool
@@ -14,7 +16,7 @@ export class TransactionManager {
   /**
    * Execute steps in a transaction
    * @param {Array} steps - Steps to execute
-   * @param {Object} options - { lockTimeout, statementTimeout, dryRun, continueOnError }
+   * @param {Object} options - { lockTimeout, statementTimeout, dryRun, continueOnError, lockKey, lockMode }
    * @returns {Promise<Array>} Results of each step
    */
   async executeTransactional(steps, options = {}) {
@@ -27,11 +29,38 @@ export class TransactionManager {
       if (options.lockTimeout) {
         await client.query(`SET LOCAL lock_timeout = '${options.lockTimeout}'`);
       }
-      if (options.statementTimeout) {
-        await client.query(`SET LOCAL statement_timeout = '${options.statementTimeout}'`);
+      if (options.lockStatementTimeout || options.statementTimeout) {
+        // Bounds the advisory-lock query itself; reset to the DDL
+        // statementTimeout once the lock is held.
+        await client.query(`SET LOCAL statement_timeout = '${options.lockStatementTimeout || options.statementTimeout}'`);
       }
 
       await client.query(`SET LOCAL search_path = 'public'`);
+
+      // Transaction-scoped advisory lock (auto-releases on COMMIT/ROLLBACK).
+      // Respects the lock_timeout set above (55P03 on timeout in blocking mode).
+      if (options.lockKey) {
+        const lockMode = options.lockMode || 'blocking';
+        if (lockMode === 'try') {
+          const lockResult = await client.query(
+            'SELECT pg_try_advisory_xact_lock($1) AS acquired',
+            [options.lockKey]
+          );
+          if (!lockResult.rows[0].acquired) {
+            throw new LockAcquisitionError(
+              `Transaction-scoped advisory lock ${options.lockKey} could not be acquired (try mode). ` +
+              `Another transaction may be modifying this database concurrently.`,
+              { lockKey: options.lockKey }
+            );
+          }
+        } else {
+          await client.query('SELECT pg_advisory_xact_lock($1)', [options.lockKey]);
+        }
+      }
+
+      if (options.statementTimeout) {
+        await client.query(`SET LOCAL statement_timeout = '${options.statementTimeout}'`);
+      }
 
       for (const step of steps) {
         const startTime = Date.now();

@@ -5,17 +5,20 @@
 import crypto from 'crypto';
 import { SchemaIntrospector } from './introspection/index.js';
 import { SchemaDiffer } from './differ/index.js';
+import { ReverseDependencyIntrospector } from './differ/reverse-dependency-introspector.js';
 import { MigrationPlanner } from './planner/index.js';
 import { MigrationExecutor } from './executor/migration-executor.js';
 import { TransactionManager } from './executor/transaction-manager.js';
 import { MigrationTable } from './storage/migration-table.js';
 import { RollbackGenerator } from './storage/rollback-generator.js';
+import { ExecutionLog } from './storage/execution-log.js';
 import { BehavioralExtractor } from './behavioral/behavioral-extractor.js';
 import { BehavioralApplier } from './behavioral/behavioral-applier.js';
 import { DdlGenerator } from './ddl-generator/index.js';
 import { RiskEngine } from './risk/index.js';
 import { InMemoryStorageProvider } from './storage/index.js';
 import { CrashRecovery } from './recovery/index.js';
+import { MigrationStateMachine, ACTIVE_STATUSES } from './state-machine/index.js';
 import {
   MigrationError,
   ExecutionError,
@@ -70,6 +73,10 @@ export {
   RollbackGenerator,
   InMemoryStorageProvider,
   CrashRecovery,
+  MigrationStateMachine,
+  ExecutionLog,
+  ReverseDependencyIntrospector,
+  ACTIVE_STATUSES,
   MigrationError,
   ExecutionError,
   IntrospectionError,
@@ -88,15 +95,28 @@ export {
   PlanBlockedError,
   RecoveryError,
   DestructiveChangeError,
+  MIGRATION_STATUS,
+  DB_STATUS,
 };
 
-import { RISK_LEVELS, RISK_LEVEL_ORDER, mapExecutorStatusToDb } from './constants.js';
+import { RISK_LEVELS, RISK_LEVEL_ORDER, mapExecutorStatusToDb, MIGRATION_STATUS, DB_STATUS } from './constants.js';
 
 /**
  * @typedef {Object} EngineConfig
  * @property {string} [engineVersion='1.0.0']
- * @property {string} [lockTimeout='5s']
+ * @property {string} [lockTimeout='5s'] - Lock wait timeout (lock_timeout)
+ * @property {'blocking'|'try'|'queue'} [lockMode='blocking'] - Lock acquisition mode:
+ *   'blocking' waits up to lockTimeout, 'try' fails immediately, 'queue' uses a
+ *   FIFO per-connectionId queue before acquiring
+ * @property {'database'|'application'} [heartbeatMethod='database'] - Lock heartbeat
+ *   verification: 'database' queries pg_locks (detects silent connection loss),
+ *   'application' uses the fast in-memory check
+ * @property {string} [lockStatementTimeout='15s'] - Timeout for the advisory-lock
+ *   query itself; statement_timeout is set to this while acquiring the lock and
+ *   reset to statementTimeout for the DDL steps afterwards
  * @property {string} [statementTimeout='30s']
+ * @property {number} [checkpointInterval=0] - Persist an execution checkpoint
+ *   every N completed steps (0 disables checkpointing)
  * @property {boolean} [dryRun=false]
  * @property {boolean} [snapshotBefore=true]
  * @property {boolean} [verifyAfter=true]
@@ -116,7 +136,9 @@ export class SwMigrationEngine {
     this.config = {
       engineVersion: '1.0.0',
       lockTimeout: '5s',
+      lockStatementTimeout: '15s',
       statementTimeout: '30s',
+      checkpointInterval: 0,
       dryRun: false,
       snapshotBefore: true,
       verifyAfter: true,
@@ -192,6 +214,26 @@ export class SwMigrationEngine {
   generateDDL(diff, options = {}) {
     const changes = Array.isArray(diff) ? diff : (diff.changes || []);
     return this.ddlGenerator.generate(changes, options);
+  }
+
+  /**
+   * STEP 3.5: Expand a change set with implicit DROP changes for reverse
+   * dependents (Layer 4). Queries the live database catalogs to find objects
+   * depending on DROP targets and returns the expanded list.
+   *
+   * @param {import('pg').Pool} [pool]
+   * @param {Array<Object>} changes - SchemaDiff changes
+   * @param {Object} [options] - See ReverseDependencyIntrospector.expandDropChanges
+   * @returns {Promise<{changes: Array, additions: Array, warnings: Array, assessments: Array}>}
+   */
+  async expandDropDependencies(pool, changes, options = {}) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const introspector = new ReverseDependencyIntrospector(usePool);
+    return introspector.expandDropChanges(changes, options);
   }
 
   /**
@@ -348,6 +390,24 @@ export class SwMigrationEngine {
       };
     }
 
+    // Layer 4: expand DROP changes with reverse dependents from the live
+    // catalog (FKs pointing at dropped tables, views on dropped tables,
+    // indexes/constraints on dropped columns, domains on dropped types, ...)
+    if (usePool && options.expandDropDependencies !== false) {
+      const introspector = new ReverseDependencyIntrospector(usePool);
+      const expanded = await introspector.expandDropChanges(diff.changes, options);
+      if (expanded.additions.length > 0 || expanded.warnings.length > 0) {
+        diff.changes = expanded.changes;
+        diff.warnings = [...diff.warnings, ...expanded.warnings];
+        diff.summary.totalChanges = diff.changes.length;
+        diff.summary.drops = diff.changes.filter(c => c.changeType === 'DROP').length;
+        diff.dependencyExpansion = {
+          added: expanded.additions.length,
+          additions: expanded.additions.map(a => ({ objectType: a.objectType, objectKey: a.objectKey, implicitDependencyOf: a.implicitDependencyOf })),
+        };
+      }
+    }
+
     const plan = this.plan(diff, options);
 
     if (plan.blocked) {
@@ -455,6 +515,13 @@ export class SwMigrationEngine {
       }
     }
 
+    // Attach the diff to the plan so the migration record stores the full
+    // schema_diff (used by generateRollbackSQL / _buildRollbackSteps) and the
+    // executor can build rollback SQL for executed changes.
+    if (plan && !plan.diff && diff) {
+      plan.diff = diff;
+    }
+
     const result = await this.execute(usePool, plan, execOptions);
     return {
       ...result,
@@ -484,6 +551,40 @@ export class SwMigrationEngine {
   }
 
   /**
+   * Get full execution trace for a migration from migration_execution_log.
+   * @param {import('pg').Pool} [pool]
+   * @param {string} migrationId
+   * @returns {Promise<Array>}
+   */
+  async getExecutionTrace(pool, migrationId) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const storage = new MigrationTable(usePool, this.config.connectionId || null);
+    await storage.ensureTable();
+    return storage.getExecutionTrace(migrationId);
+  }
+
+  /**
+   * Get step-level summary (grouped by step) for a migration.
+   * @param {import('pg').Pool} [pool]
+   * @param {string} migrationId
+   * @returns {Promise<Array>}
+   */
+  async getExecutionStepSummary(pool, migrationId) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const storage = new MigrationTable(usePool, this.config.connectionId || null);
+    await storage.ensureTable();
+    return storage.getExecutionStepSummary(migrationId);
+  }
+
+  /**
    * Get last successful migration
    * @param {import('pg').Pool} [pool]
    * @param {Object} [options]
@@ -502,10 +603,20 @@ export class SwMigrationEngine {
   }
 
   /**
-   * Rollback a migration (best-effort)
+   * Rollback a migration (best-effort).
+   *
+   * Valid source states: completed, partially_applied, failed. For
+   * partially_applied/failed migrations only changes that were actually
+   * executed (per execution_results.executedSteps) are rolled back.
+   *
+   * Lifecycle: <source> -> rolling_back -> rolled_back (success) or
+   * <source> -> rolling_back -> failed (a rollback step failed). Every
+   * rollback step is recorded into the execution log.
+   *
    * @param {import('pg').Pool} [pool]
    * @param {string} migrationId
    * @param {Object} [options]
+   * @param {string} [options.rolledBackBy] - User/system that triggered the rollback
    * @returns {Promise<Object>}
    */
   async rollback(pool, migrationId, options = {}) {
@@ -523,11 +634,15 @@ export class SwMigrationEngine {
       throw new RollbackError(`Migration ${migrationId} not found.`);
     }
 
-    if (migration.status !== 'completed') {
-      throw new RollbackError(`Cannot rollback migration with status "${migration.status}".`);
+    const rollbackable = ['completed', 'partially_applied', 'failed'];
+    if (!rollbackable.includes(migration.status)) {
+      throw new RollbackError(
+        `Cannot rollback migration with status "${migration.status}". ` +
+        `Rollback is only valid from ${rollbackable.join(', ')}.`
+      );
     }
 
-    const rollbackSteps = this.rollbackGenerator.generateRollback(migration);
+    const rollbackSteps = this._buildRollbackSteps(migration);
 
     if (rollbackSteps.length === 0) {
       return {
@@ -544,40 +659,194 @@ export class SwMigrationEngine {
       }
     }
 
+    // Enter rolling_back (valid from completed/partially_applied/failed).
+    await storage.stateMachine.transition(migrationId, 'rolling_back', {
+      reason: 'engine_rollback',
+      rolled_back_by: options.rolledBackBy || null,
+    }).catch((error) => {
+      console.warn(`[Engine] Failed to transition ${migrationId} to rolling_back: ${error.message}`);
+    });
+
     const transactional = rollbackSteps.filter(s => s.isTransactional);
     const nonTransactional = rollbackSteps.filter(s => !s.isTransactional);
 
     const results = [];
+    const logStep = async (step, result) => {
+      if (!storage.executionLog?.logStep) return;
+      try {
+        await storage.executionLog.logStep({
+          migrationId,
+          stepId: `rb_${String(step.originalChangeId || 'unknown').slice(0, 90)}`,
+          phase: 0,
+          status: result.success ? 'completed' : 'failed',
+          sql: step.sql,
+          isTransactional: step.isTransactional,
+          errorCode: result.code || null,
+          errorMessage: result.error || null,
+          postCheckResult: { rollback: true, changeId: step.originalChangeId },
+        });
+      } catch (logError) {
+        // Best-effort: rollback logging must never break the rollback.
+      }
+    };
 
     if (transactional.length > 0) {
-      const tm = new TransactionManager(usePool);
-      const txResults = await tm.executeTransactional(
-        transactional.map(s => ({ id: s.originalChangeId, sql: s.sql })),
-        {
-          lockTimeout: this.config.lockTimeout,
-          statementTimeout: this.config.statementTimeout,
+      try {
+        const tm = new TransactionManager(usePool);
+        const txResults = await tm.executeTransactional(
+          transactional.map(s => ({ id: s.originalChangeId, sql: s.sql })),
+          {
+            lockTimeout: options.lockTimeout || this.config.lockTimeout,
+            statementTimeout: options.statementTimeout || this.config.statementTimeout,
+            continueOnError: true,
+          }
+        );
+        for (let i = 0; i < txResults.length; i++) {
+          const step = transactional[i];
+          const r = txResults[i];
+          results.push({ ...r, changeType: step.changeType, objectKey: step.objectKey, isTransactional: true });
+          await logStep(step, r);
         }
-      );
-      results.push(...txResults);
+      } catch (txError) {
+        results.push({
+          stepId: 'tx_batch',
+          success: false,
+          error: txError.message,
+          code: txError.code,
+          isTransactional: true,
+          changeType: 'BATCH',
+          objectKey: null,
+        });
+      }
     }
 
-    for (const step of nonTransactional) {
-      const tm = new TransactionManager(usePool);
-      const result = await tm.executeNonTransactional(
-        { id: step.originalChangeId, sql: step.sql },
-        { statementTimeout: this.config.statementTimeout }
-      );
-      results.push(result);
+    for (let i = 0; i < nonTransactional.length; i++) {
+      const step = nonTransactional[i];
+      try {
+        const tm = new TransactionManager(usePool);
+        const r = await tm.executeNonTransactional(
+          { id: step.originalChangeId, sql: step.sql },
+          { statementTimeout: options.statementTimeout || this.config.statementTimeout }
+        );
+        results.push({ ...r, changeType: step.changeType, objectKey: step.objectKey, isTransactional: false });
+        await logStep(step, r);
+      } catch (stepError) {
+        const r = {
+          stepId: step.originalChangeId,
+          success: false,
+          error: stepError.message,
+          code: stepError.code,
+          isTransactional: false,
+          changeType: step.changeType,
+          objectKey: step.objectKey,
+        };
+        results.push(r);
+        await logStep(step, r);
+      }
     }
 
-    await storage.markRolledBack(migrationId);
+    const failedResults = results.filter(r => !r.success);
+    const success = failedResults.length === 0;
+
+    if (success) {
+      await storage.markRolledBack(migrationId, options.rolledBackBy || null);
+    } else {
+      await storage.stateMachine.transition(migrationId, 'failed', {
+        reason: 'rollback_failed',
+        rolled_back_by: options.rolledBackBy || null,
+        failedStepCount: failedResults.length,
+      }).catch((error) => {
+        console.warn(`[Engine] Failed to mark ${migrationId} as failed after rollback error: ${error.message}`);
+      });
+    }
 
     return {
-      success: results.every(r => r.success),
+      success,
       migrationId,
-      status: 'rolled_back',
+      status: success ? 'rolled_back' : 'failed',
       steps: results,
+      rollbackStatus: nonTransactional.length > 0 ? 'PARTIAL' : 'FULL',
+      manualRecoveryRequired: nonTransactional.length > 0,
+      failedSteps: failedResults.map(r => ({
+        stepId: r.stepId,
+        error: r.error,
+        code: r.code,
+      })),
       warning: 'Rollback is best-effort. Some changes (DROP TABLE, DROP COLUMN, enum value removal) cannot be reversed.',
+    };
+  }
+
+  /**
+   * Build best-effort rollback steps for a migration record.
+   * Completed migrations roll back every change in reverse order; failed /
+   * partially_applied migrations only roll back changes whose steps were
+   * recorded as executed (execution_results.executedSteps changeIds).
+   * @param {Object} migration - Record from getRollbackSQL
+   * @returns {Array<{sql: string, originalChangeId: string, changeType: string, objectKey: string, isTransactional: boolean}>}
+   */
+  _buildRollbackSteps(migration) {
+    const diff = migration.schema_diff || migration.diff;
+    let changes = diff?.changes || [];
+
+    if (migration.status !== 'completed') {
+      const executedChangeIds = new Set(
+        (migration.execution_results?.executedSteps || [])
+          .filter(s => s.status === 'completed' && s.changeId)
+          .map(s => s.changeId)
+      );
+      if (executedChangeIds.size === 0) {
+        return [];
+      }
+      changes = changes.filter(c => executedChangeIds.has(c.id));
+    }
+
+    const steps = [];
+    for (const change of [...changes].reverse()) {
+      const undo = this.rollbackGenerator.generateUndoForChange(change);
+      if (!undo) continue;
+      steps.push({
+        sql: undo,
+        originalChangeId: change.id,
+        changeType: change.changeType,
+        objectKey: change.objectKey || change.path,
+        isTransactional: !this.rollbackGenerator.isNonTransactionalRollback(change, undo),
+      });
+    }
+    return steps;
+  }
+
+  /**
+   * Generate a best-effort rollback SQL script for a migration without
+   * executing anything. Useful for previewing rollback before applying.
+   * @param {import('pg').Pool} [pool]
+   * @param {string} migrationId
+   * @returns {Promise<Object>} { script, steps, status, manualRecoveryRequired }
+   */
+  async generateRollbackSQL(pool, migrationId) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const connectionId = this.config.connectionId || null;
+    const storage = new MigrationTable(usePool, connectionId);
+    await storage.ensureTable();
+
+    const migration = await storage.getRollbackSQL(migrationId);
+    if (!migration) {
+      throw new RollbackError(`Migration ${migrationId} not found.`);
+    }
+
+    const steps = this._buildRollbackSteps(migration);
+    const nonTransactional = steps.filter(s => !s.isTransactional);
+
+    return {
+      migrationId,
+      status: migration.status,
+      steps,
+      script: this.rollbackGenerator.generateRollbackScript(migration),
+      manualRecoveryRequired: nonTransactional.length > 0,
+      stepCount: steps.length,
     };
   }
 
@@ -601,6 +870,67 @@ export class SwMigrationEngine {
     const recovery = new CrashRecovery(usePool, introspector, storage);
 
     return recovery.reconcile(connectionId);
+  }
+
+  /**
+   * Startup recovery — call once after the app boots (and the pool is
+   * ready) to reconcile any migrations left in active/stale states by a
+   * previous process crash.
+   *
+   * Safe to call on every boot: reconciles per connection and tolerates
+   * missing tables (fresh databases).
+   *
+   * @param {import('pg').Pool} [pool]
+   * @param {Object} [options]
+   * @param {string} [options.connectionId]
+   * @returns {Promise<{reconciled: number, failed: number, manualReview: number, connections: Array}>}
+   */
+  async startup(pool, options = {}) {
+    const usePool = pool || this.pool;
+    if (!usePool) {
+      throw new StorageError('Database pool is required.');
+    }
+
+    const connectionId = options.connectionId || this.config.connectionId || null;
+
+    if (connectionId) {
+      const result = await this.reconcile(usePool, { connectionId });
+      return {
+        reconciled: result.reconciled?.length || 0,
+        failed: result.failed?.length || 0,
+        manualReview: result.manualReview?.length || 0,
+        staleMigrations: result.staleMigrations?.length || 0,
+        connections: [{ connectionId, result }],
+      };
+    }
+
+    const distinct = await usePool.query(`
+      SELECT DISTINCT connection_id
+      FROM migration_history
+      WHERE status IN ('pending', 'acquiring_lock', 'running', 'verifying', 'completing')
+    `).catch(() => ({ rows: [] }));
+
+    const connections = [];
+    let reconciled = 0;
+    let failed = 0;
+    let manualReview = 0;
+    let staleMigrations = 0;
+
+    for (const row of distinct.rows) {
+      try {
+        const result = await this.reconcile(usePool, { connectionId: row.connection_id });
+        reconciled += result.reconciled?.length || 0;
+        failed += result.failed?.length || 0;
+        manualReview += result.manualReview?.length || 0;
+        staleMigrations += result.staleMigrations?.length || 0;
+        connections.push({ connectionId: row.connection_id, result });
+      } catch (error) {
+        console.warn(`[SwMigrationEngine] Startup reconciliation failed for ${row.connection_id}: ${error.message}`);
+        connections.push({ connectionId: row.connection_id, error: error.message });
+      }
+    }
+
+    return { reconciled, failed, manualReview, staleMigrations, connections };
   }
 
   /**

@@ -72,6 +72,7 @@ export class MigrationConflictError extends MigrationError {
   constructor(message, details) {
     super(message, details);
     this.name = 'MigrationConflictError';
+    this.code = details?.code || 'CONCURRENT_MIGRATION';
   }
 }
 

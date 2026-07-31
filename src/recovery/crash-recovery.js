@@ -4,12 +4,14 @@
  */
 
 import { StorageError, RecoveryError } from '../errors.js';
+import { MigrationStateMachine } from '../state-machine/migration-state-machine.js';
 
 export class CrashRecovery {
   constructor(pool, introspector, storage) {
     this.pool = pool;
     this.introspector = introspector;
     this.storage = storage;
+    this.stateMachine = storage.stateMachine || new MigrationStateMachine(pool);
   }
 
   /**
@@ -23,6 +25,7 @@ export class CrashRecovery {
       connectionId,
       checkedAt: new Date().toISOString(),
       runningMigrations: [],
+      staleMigrations: [],
       pendingMigrations: [],
       reconciled: [],
       failed: [],
@@ -30,19 +33,28 @@ export class CrashRecovery {
     };
 
     try {
-      const runningMigrations = await this.storage.getByStatus(connectionId, 'running');
-      results.runningMigrations = runningMigrations.map(m => ({
+      // Heartbeat-based stale detection across ALL active statuses
+      // (acquiring_lock, running, verifying, completing).
+      const staleMigrations = await this.stateMachine.findStale(this.pool, connectionId);
+      results.staleMigrations = staleMigrations.map(m => ({
         id: m.id,
         version: m.version,
         name: m.name,
         status: m.status,
         createdAt: m.created_at,
+        lastHeartbeatAt: m.last_heartbeat_at,
       }));
 
-      for (const migration of runningMigrations) {
+      for (const migration of staleMigrations) {
         try {
+          // Active status -> stale is always a valid transition.
+          await this.stateMachine.transition(migration.id, 'stale', {
+            reason: 'heartbeat_timeout',
+            previous_status: migration.status,
+          });
+
           const reconciliation = await this.reconcileMigration(migration);
-          
+
           if (reconciliation.status === 'completed') {
             results.reconciled.push(reconciliation);
           } else if (reconciliation.status === 'failed') {
@@ -130,8 +142,34 @@ export class CrashRecovery {
     const appliedChanges = [];
     const notAppliedChanges = [];
 
+    // Execution-log trace: steps the engine logged as completed are trusted
+    // as applied without re-introspection; entries logged as failed are
+    // treated as not-applied. The trace augments (never overrides)
+    // introspection, which remains the source of truth.
+    const trace = await this.getExecutionTrace(migration.id);
+    const logCompleted = new Set();
+    const logFailed = new Set();
+    if (trace && trace.length > 0) {
+      for (const entry of trace) {
+        const key = String(entry.step_id);
+        if (entry.status === 'completed') logCompleted.add(key);
+        else if (entry.status === 'failed') logFailed.add(key);
+      }
+    }
+    result.executionTrace = trace
+      ? { entries: trace.length, completed: logCompleted.size, failed: logFailed.size }
+      : null;
+
     for (const change of expectedChanges) {
-      const isApplied = await this.isChangeApplied(change, migration);
+      const changeId = String(change.id ?? '');
+      // Logged as failed -> definitely not applied (skip the DB round-trip).
+      if (changeId && logFailed.has(changeId)) {
+        notAppliedChanges.push(change);
+        continue;
+      }
+      // Logged as completed -> trust the execution log, skip introspection.
+      const isApplied = (changeId && logCompleted.has(changeId)) ||
+        await this.isChangeApplied(change, migration);
       if (isApplied) {
         appliedChanges.push(change);
       } else {
@@ -170,7 +208,7 @@ export class CrashRecovery {
       });
       
     } else {
-      result.status = 'partial_manual_review';
+      result.status = 'needs_review';
       result.detection = 'partial';
       result.message = 'Partial changes detected - manual review required';
       result.appliedChanges = appliedChanges.map(c => ({
@@ -179,7 +217,7 @@ export class CrashRecovery {
         objectName: c.objectName || c.tableName,
       }));
       
-      await this.updateMigrationStatus(migration.id, 'partial_manual_review', {
+      await this.updateMigrationStatus(migration.id, 'needs_review', {
         reconciliation: {
           detected: 'partial',
           method: 'introspection',
@@ -191,6 +229,22 @@ export class CrashRecovery {
     }
 
     return result;
+  }
+
+  /**
+   * Best-effort execution-log trace for a migration.
+   * Returns null when logging is unavailable (table missing, storage without
+   * an execution log) so reconciliation never depends on it.
+   * @param {string} migrationId
+   * @returns {Promise<Array<Object>|null>}
+   */
+  async getExecutionTrace(migrationId) {
+    if (!this.storage?.executionLog?.getTrace) return null;
+    try {
+      return await this.storage.executionLog.getTrace(migrationId);
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -222,11 +276,25 @@ export class CrashRecovery {
         return await this.objectExists('views', schemaName, objectName);
       
       case 'function':
-        return await this.functionExists(schemaName, objectName);
+        return await this.functionExists(schemaName, objectName, 'FUNCTION');
+      
+      case 'procedure':
+        return await this.functionExists(schemaName, objectName, 'PROCEDURE');
       
       case 'trigger':
         return await this.triggerExists(schemaName, objectName);
       
+      case 'materializedview':
+      case 'matview':
+        return await this.matviewExists(schemaName, objectName);
+      
+      case 'policy':
+        return await this.policyExists(schemaName, objectName);
+      
+      case 'rule':
+        return await this.ruleExists(schemaName, objectName);
+      
+      case 'domain':
       case 'enum':
       case 'type':
         return await this.typeExists(schemaName, objectName);
@@ -299,16 +367,67 @@ export class CrashRecovery {
   }
 
   /**
-   * Check if a function exists
+   * Check if a function or procedure exists
    */
-  async functionExists(schemaName, functionName) {
+  async functionExists(schemaName, functionName, routineType = 'FUNCTION') {
     try {
       const result = await this.pool.query(`
         SELECT EXISTS (
           SELECT 1 FROM information_schema.routines 
-          WHERE routine_schema = $1 AND routine_name = $2 AND routine_type = 'FUNCTION'
+          WHERE routine_schema = $1 AND routine_name = $2 AND routine_type = $3
         )
-      `, [schemaName || 'public', functionName]);
+      `, [schemaName || 'public', functionName, routineType]);
+      return result.rows[0]?.exists || false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if a materialized view exists
+   */
+  async matviewExists(schemaName, matviewName) {
+    try {
+      const result = await this.pool.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_matviews 
+          WHERE schemaname = $1 AND matviewname = $2
+        )
+      `, [schemaName || 'public', matviewName]);
+      return result.rows[0]?.exists || false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if a policy exists
+   */
+  async policyExists(schemaName, policyName) {
+    try {
+      const result = await this.pool.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_policies 
+          WHERE schemaname = $1 AND policyname = $2
+        )
+      `, [schemaName || 'public', policyName]);
+      return result.rows[0]?.exists || false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if a rule exists
+   */
+  async ruleExists(schemaName, ruleName) {
+    try {
+      const result = await this.pool.query(`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_rules 
+          WHERE schemaname = $1 AND rulename = $2
+        )
+      `, [schemaName || 'public', ruleName]);
       return result.rows[0]?.exists || false;
     } catch {
       return false;
@@ -368,12 +487,27 @@ export class CrashRecovery {
 
   /**
    * Update migration status with metadata
+   * Routes through the state machine when the transition is valid
+   * (stale -> completed/failed/needs_review), otherwise falls back to a
+   * direct update so a committed migration is never left stuck.
    */
   async updateMigrationStatus(migrationId, status, metadata) {
     try {
+      const current = await this.stateMachine.getStatus(migrationId).catch(() => null);
+
+      if (current && this.stateMachine.canTransition(current, status)) {
+        await this.stateMachine.transition(migrationId, status, {
+          reason: 'reconciliation',
+          ...metadata,
+        });
+        return;
+      }
+
       await this.pool.query(`
         UPDATE migration_history 
         SET status = $1,
+            status_previous = status,
+            status_changed_at = now(),
             applied_at = CASE WHEN $1 = 'completed' THEN COALESCE(applied_at, now()) ELSE applied_at END,
             metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
         WHERE id = $3

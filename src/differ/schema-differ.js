@@ -8,6 +8,9 @@ import { PropertyDiffer } from './property-differ.js';
 import { DependencyResolver } from './dependency-resolver.js';
 import { ChangeClassifier } from './change-classifier.js';
 import { RiskTagger } from './risk-tagger.js';
+import { isEngineInternalChange, isInternalObjectKey } from './utils/internal-objects.js';
+
+export { isEngineInternalChange, isInternalObjectKey };
 
 /**
  * Schema Differ - Main orchestrator for comparing two schema snapshots.
@@ -69,6 +72,13 @@ export class SchemaDiffer {
     // Step 1: Match objects between snapshots
     const matched = this.objectMatcher.match(desired, current);
 
+    // Step 1.5: FK constraints nested inside desired table objects.
+    // CREATE TABLE never renders FKs inline, so they are emitted as explicit
+    // ADD_FOREIGN_KEY constraint changes. Running after every table create
+    // (phase 10+) also makes circular FK pairs work: both tables exist before
+    // either FK is added, so no DEFERRABLE tricks are needed.
+    allChanges.push(...this.extractNestedForeignKeys(desired, current));
+
     // Step 2: Handle creates (objects only in desired)
     for (const create of matched.creates) {
       allChanges.push(this.createChangeObject('CREATE', create.objectType, create.key, null, create.object, create));
@@ -120,11 +130,20 @@ export class SchemaDiffer {
 
     // Step 6: Process warnings from property differ
 
+    // Step 6.5: Drop changes for the engine's own bookkeeping objects
+    // (migration_history / migration_execution_log tables, their indexes,
+    // constraints, the migration_status type, the transition-trigger
+    // function/trigger) plus core/synthetic extensions (plpgsql is required
+    // by the engine's own trigger functions, uuid-ossp is always reported by
+    // the introspector). These objects are owned by the migration engine and
+    // must never be diffed into a plan.
+    const userChanges = allChanges.filter(change => !isEngineInternalChange(change));
+
     // Step 7: Classify changes (track 1 vs track 2)
-    this.changeClassifier.classify(allChanges);
+    this.changeClassifier.classify(userChanges);
 
     // Step 8: Resolve dependency order
-    const orderedChanges = this.dependencyResolver.resolve(allChanges, desired, current);
+    const orderedChanges = this.dependencyResolver.resolve(userChanges, desired, current);
 
     // Step 9: Tag risks
     this.riskTagger.tag(orderedChanges);
@@ -255,6 +274,53 @@ export class SchemaDiffer {
   /**
    * Build summary statistics.
    */
+  /**
+   * Extract FOREIGN KEY constraints nested inside desired table objects and
+   * turn them into standalone ADD_FOREIGN_KEY constraint changes. This is the
+   * only path that creates FKs from the compact table-centric desired schema
+   * format (CREATE TABLE never renders FKs inline).
+   */
+  extractNestedForeignKeys(desired, current) {
+    const changes = [];
+    const currentConstraints = current.constraints || {};
+    const desiredConstraints = desired.constraints || {};
+
+    for (const [tableKey, tableObj] of Object.entries(desired.tables || {})) {
+      const cons = Array.isArray(tableObj.constraints) ? tableObj.constraints : [];
+      for (const con of cons) {
+        if (con.constraintType !== 'FOREIGN_KEY' && con.constraintType !== 'FOREIGN KEY') continue;
+        const name = con.name;
+        if (!name) continue;
+
+        const key = `${tableKey}.${name}`;
+        // Already tracked via the top-level constraints section (desired or
+        // current) - skip to avoid duplicates.
+        if (desiredConstraints[key] || currentConstraints[key]) continue;
+
+        const schema = tableObj.schema || tableKey.split('.')[0] || 'public';
+        const tableName = tableObj.name || tableKey.split('.')[1] || '';
+
+        // Normalize the referenced table to a full key so the dependency
+        // resolver can find the referenced table's CREATE change.
+        let refTable = con.referencedTable || con.refTable || '';
+        if (refTable && !refTable.includes('.')) {
+          refTable = `${con.referencedSchema || con.refSchema || schema}.${refTable}`;
+        }
+
+        changes.push(this.createChangeObject(
+          'ADD_FOREIGN_KEY',
+          'constraint',
+          key,
+          null,
+          { ...con, name, schema, tableName, tableKey, referencedTable: refTable, constraintType: 'FOREIGN_KEY' },
+          { constraintType: 'FOREIGN_KEY', name, schema, tableName, referencedTable: refTable }
+        ));
+      }
+    }
+
+    return changes;
+  }
+
   buildSummary(changes) {
     const summary = {
       totalChanges: changes.length,
