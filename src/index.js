@@ -292,14 +292,17 @@ export class SwMigrationEngine {
       );
     }
 
-    const storage = new MigrationTable(usePool, connectionId);
+    const { toUUID } = await import('./storage/migration-table.js');
+    const normalizedConnectionId = connectionId ? toUUID(connectionId) : null;
+
+    const storage = new MigrationTable(usePool, normalizedConnectionId || connectionId);
     await storage.ensureTable();
 
     const introspector = new SchemaIntrospector(usePool);
     const executor = new MigrationExecutor(usePool, introspector, storage, {
       ...this.config,
       ...options,
-      connectionId,
+      connectionId: normalizedConnectionId || connectionId,
     });
 
     if (options.onProgress) {
@@ -364,6 +367,13 @@ export class SwMigrationEngine {
       );
     }
 
+    const { toUUID } = await import('./storage/migration-table.js');
+    const normalizedConnectionId = connectionId ? toUUID(connectionId) : null;
+    if (normalizedConnectionId !== connectionId && options.connectionId) {
+      options.connectionId = normalizedConnectionId;
+    }
+
+
     const current = await this.introspect(usePool, options);
 
     if (current.checksum === normalizedSchema.checksum) {
@@ -422,7 +432,7 @@ export class SwMigrationEngine {
       };
     }
 
-    const execOptions = { ...options, connectionId };
+    const execOptions = { ...options, connectionId: normalizedConnectionId || connectionId };
     const acceptDataLoss = options.acceptDataLoss || this.config.acceptDataLoss;
     const warningsEnabled = options.warningsEnabled !== undefined ? options.warningsEnabled : this.config.warningsEnabled;
     const interactive = options.interactive !== undefined ? options.interactive : this.config.interactive;
@@ -863,13 +873,15 @@ export class SwMigrationEngine {
     }
 
     const connectionId = options.connectionId || this.config.connectionId || null;
-    const storage = new MigrationTable(usePool, connectionId);
+    const { toUUID } = await import('./storage/migration-table.js');
+    const normalizedConnectionId = connectionId ? toUUID(connectionId) : null;
+    const storage = new MigrationTable(usePool, normalizedConnectionId || connectionId);
     await storage.ensureTable();
 
     const introspector = new SchemaIntrospector(usePool);
     const recovery = new CrashRecovery(usePool, introspector, storage);
 
-    return recovery.reconcile(connectionId);
+    return recovery.reconcile(normalizedConnectionId || connectionId);
   }
 
   /**
@@ -1069,6 +1081,16 @@ diffSchemas(desired, current) {
       ORDER BY n.nspname, c.relname
     `);
 
+    // Mirror captureSnapshot(): column-level drift detection needs the full
+    // introspection (schemas/tables/columns), not just object checksums.
+    let fullSnapshot = null;
+    try {
+      const introspector = new SchemaIntrospector(usePool);
+      fullSnapshot = await introspector.introspect();
+    } catch (snapshotError) {
+      console.warn(`[MigrationEngine] Could not capture full drift snapshot: ${snapshotError.message}`);
+    }
+
     return {
       timestamp: new Date().toISOString(),
       objectCount: result.rows.length,
@@ -1078,6 +1100,7 @@ diffSchemas(desired, current) {
         kind: r.kind,
         checksum: r.checksum,
       })),
+      ...(fullSnapshot || {}),
     };
   }
 

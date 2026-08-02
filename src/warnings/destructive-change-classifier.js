@@ -11,7 +11,12 @@ export class DestructiveChangeClassifier {
     if (classifier) return classifier(change);
     const wildcard = this.wildcards[ct];
     if (wildcard) return wildcard(change);
-    return { level: 'safe', reason: 'Unknown operation, treated as safe' };
+    
+    if (ct === 'REMOVE_ENUM_VALUES' || ct === 'WIDENING_CAST' || ct === 'NARROWING_CAST') {
+      return { level: 'data_loss', reason: `${ct} operation may cause data loss`, requiresPreflightCheck: true };
+    }
+    
+    return { level: 'high_risk', reason: `Unknown operation type "${ct}" - treated as high risk for safety` };
   }
 
   constructor() {
@@ -135,6 +140,29 @@ export class DestructiveChangeClassifier {
       if (change.property === 'dataType') return { level: 'data_risk', reason: 'Sequence type change' };
       return safe();
     });
+    
+    this.addClassifier('REMOVE_ENUM_VALUES', (change) => ({
+      level: 'data_loss',
+      reason: 'Removing enum values requires DROP TYPE CASCADE which destroys dependent columns',
+      requiresPreflightCheck: true,
+      affectedRowsQuery: change.objectKey ? this.getEnumUsageQuery(change) : null,
+    }));
+    
+    this.addClassifier('NARROWING_CAST', (change) => {
+      const info = this.getNarrowingInfo(change);
+      return {
+        level: 'data_loss',
+        reason: info?.reason || 'Narrowing type cast may truncate data',
+        affectedRowsQuery: info?.query || null,
+        requiresPreflightCheck: true,
+        details: info,
+      };
+    });
+    
+    this.addClassifier('WIDENING_CAST', () => ({
+      level: 'safe',
+      reason: 'Widening type cast preserves all data',
+    }));
   }
 
   addClassifier(key, fn) {
@@ -280,5 +308,18 @@ export class DestructiveChangeClassifier {
     const from = (change.currentValue || change.before?.dataType || '').toUpperCase();
     const to = (change.desiredValue || change.after?.dataType || '').toUpperCase();
     return wideningPairs.some(([f, t]) => from.includes(f) && to.includes(t) && !from.includes(t));
+  }
+  
+  getEnumUsageQuery(change) {
+    const typeKey = change.objectKey;
+    if (!typeKey) return null;
+    const parts = typeKey.split('.');
+    const schema = parts[0] || 'public';
+    const typeName = parts.slice(1).join('.') || parts[0];
+    
+    return `SELECT attrelid::regclass AS table_name, attname AS column_name ` +
+           `FROM pg_attribute ` +
+           `WHERE atttypid = (SELECT oid FROM pg_type WHERE typname = '${typeName}' AND typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '${schema}')) ` +
+           `AND attnum > 0`;
   }
 }

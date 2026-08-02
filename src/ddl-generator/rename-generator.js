@@ -7,10 +7,21 @@ export function generateRenameSql(change) {
 
   const objType = (change.objectType || '').toLowerCase();
   const schemaPrefix = change.schema ? `${ident(change.schema)}.` : '';
+  
+  if (change.renameFrom === change.renameTo) {
+    return `-- Skipping self-rename: ${objType} ${change.renameFrom}`;
+  }
 
   const getTableRef = () => {
     const t = change.after?.table || change.before?.table || change.after?.tableName || change.before?.tableName;
-    if (!t) return '';
+    if (!t) {
+      const objectKey = change.objectKey || '';
+      const parts = objectKey.split('.');
+      if (parts.length >= 2) {
+        return parts.slice(0, -1).map(ident).join('.');
+      }
+      return '';
+    }
     return t.includes('.') ? t.split('.').map(ident).join('.') : (change.schema ? `${ident(change.schema)}.${ident(t)}` : ident(t));
   };
 
@@ -67,8 +78,13 @@ export function generateRenameSql(change) {
     case 'language':
       return `ALTER LANGUAGE ${ident(change.renameFrom)} RENAME TO ${ident(change.renameTo)};`;
 
-    case 'policy':
-      return `ALTER POLICY ${ident(change.renameFrom)} ON ${getTableRef()} RENAME TO ${ident(change.renameTo)};`;
+    case 'policy': {
+      const tableRef = getTableRef();
+      if (!tableRef) {
+        return `-- Cannot rename policy ${ident(change.renameFrom)}: table reference not available`;
+      }
+      return `ALTER POLICY ${ident(change.renameFrom)} ON ${tableRef} RENAME TO ${ident(change.renameTo)};`;
+    }
 
     case 'eventtrigger':
       return `ALTER EVENT TRIGGER ${ident(change.renameFrom)} RENAME TO ${ident(change.renameTo)};`;

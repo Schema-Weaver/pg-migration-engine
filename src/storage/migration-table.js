@@ -12,7 +12,7 @@ const ENGINE_VERSION = '1.0.0';
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function toUUID(input) {
   if (!input) return null;
@@ -25,6 +25,8 @@ function toUUID(input) {
   }
   return null;
 }
+
+export { toUUID };
 
 function validateConnectionId(connectionId) {
   if (!connectionId) return { valid: true, uuid: null, warning: null };
@@ -668,7 +670,10 @@ CREATE TRIGGER enforce_status_transition
 
   async createRecord(plan, connectionId = null) {
     return retryWithBackoff(async () => {
-      const cid = connectionId || this.connectionId;
+      // connectionId is required by the migration_history table (uuid column).
+      // Normalize any non-UUID string (e.g. "e13-demo-connection") via the
+      // same toUUID() conversion used by validateConnectionId().
+      const cid = toUUID(connectionId || this.connectionId);
       
       const existingRunning = await this.pool.query(`
         SELECT id, version, name, applied_at, created_at, status
@@ -1189,7 +1194,7 @@ CREATE TRIGGER enforce_status_transition
   }
 
   async getHistory(connectionId = null, limit = 50, offset = 0) {
-    const cid = connectionId || this.connectionId;
+    const cid = toUUID(connectionId || this.connectionId);
     const result = await this.pool.query(`
       SELECT id, version, name, status, direction,
              change_count, create_count, alter_count, drop_count, rename_count,
@@ -1222,7 +1227,7 @@ CREATE TRIGGER enforce_status_transition
   }
 
 async getLastMigration(connectionId = null, includeSnapshot = false) {
-    const cid = connectionId || this.connectionId;
+    const cid = toUUID(connectionId || this.connectionId);
     const columns = includeSnapshot 
       ? 'id, version, name, status, checksum, applied_at, snapshot_before, snapshot_after'
       : 'id, version, name, status, checksum, applied_at';
@@ -1237,7 +1242,7 @@ async getLastMigration(connectionId = null, includeSnapshot = false) {
   }
 
   async getHistoryForVerification(connectionId = null, limit = 100) {
-    const cid = connectionId || this.connectionId;
+    const cid = toUUID(connectionId || this.connectionId);
     const result = await this.pool.query(`
       SELECT id, version, name, checksum, sql_statements, applied_at
       FROM migration_history
@@ -1349,7 +1354,7 @@ async getLastMigration(connectionId = null, includeSnapshot = false) {
   }
 
   async getMigrationByVersion(connectionId = null, version) {
-    const cid = connectionId || this.connectionId;
+    const cid = toUUID(connectionId || this.connectionId);
     const result = await this.pool.query(`
       SELECT * FROM migration_history
       WHERE connection_id = $1 AND version = $2
@@ -1358,7 +1363,7 @@ async getLastMigration(connectionId = null, includeSnapshot = false) {
   }
 
   async getByStatus(connectionId = null, status) {
-    const cid = connectionId || this.connectionId;
+    const cid = toUUID(connectionId || this.connectionId);
     const result = await this.pool.query(`
       SELECT * FROM migration_history
       WHERE connection_id = $1 AND status = $2
@@ -1389,7 +1394,7 @@ async getLastMigration(connectionId = null, includeSnapshot = false) {
   }
 
   async getStats(connectionId = null) {
-    const cid = connectionId || this.connectionId;
+    const cid = toUUID(connectionId || this.connectionId);
     const result = await this.pool.query(`
       SELECT
         COUNT(*) as total_migrations,
@@ -1408,7 +1413,7 @@ async getLastMigration(connectionId = null, includeSnapshot = false) {
   }
 
   async cleanupOldRecords(keepCount = 100, connectionId = null) {
-    const cid = connectionId || this.connectionId;
+    const cid = toUUID(connectionId || this.connectionId);
     const result = await this.pool.query(`
       DELETE FROM migration_history
       WHERE id NOT IN (

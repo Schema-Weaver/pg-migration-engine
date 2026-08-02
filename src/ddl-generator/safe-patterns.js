@@ -79,12 +79,22 @@ export function generateSafePatterns(change) {
   // CREATE INDEX CONCURRENTLY pattern
   if (objectType === 'index' && changeType === 'CREATE' && !change.after?.isConcurrent) {
     const idx = change.after;
+    const tableIdent = (() => {
+      if (!idx.table) return '';
+      const tableStr = String(idx.table);
+      if (tableStr.includes('.') && tableStr.split('.').length === 2) {
+        const parts = tableStr.split('.');
+        return `${parts[0]}.${parts[1]}`;
+      }
+      return `${idx.schema}.${tableStr}`;
+    })();
+    
     steps.push({
       id: `safe_idx_${change.id || '1'}_1`,
       type: 'index',
       phase: 23,
       description: `Create index ${idx.name} CONCURRENTLY`,
-      sql: `CREATE INDEX CONCURRENTLY ${idx.name} ON ${idx.schema}.${idx.table}${idx.accessMethod && idx.accessMethod !== 'btree' ? ` USING ${idx.accessMethod}` : ''} (${(idx.columns || []).map(c => c.expression || qi(c.name)).join(', ')});`,
+      sql: `CREATE INDEX CONCURRENTLY ${idx.name} ON ${tableIdent}${idx.accessMethod && idx.accessMethod !== 'btree' ? ` USING ${idx.accessMethod}` : ''} (${(idx.columns || []).map(c => c.expression || qi(c.name)).join(', ')});`,
       isTransactional: false,
       riskLevel: 'low',
       dependencies: [],

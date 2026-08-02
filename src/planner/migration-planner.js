@@ -153,7 +153,23 @@ export class MigrationPlanner {
 
     const phases = {};
     for (const change of changesArray) {
-      const phase = change.phase || this.mapChangeToPhase(change);
+      let phase = change.phase || this.mapChangeToPhase(change);
+      
+      if (change.objectType === 'index' && change.changeType === 'CREATE') {
+        const idxCols = (change.after?.columns || []).map(c => typeof c === 'string' ? c : c.name);
+        const hasNewColumnDependency = changesArray.some(otherChange => {
+          if (otherChange.objectType === 'column' && otherChange.changeType === 'CREATE') {
+            const colName = otherChange.name || otherChange.after?.name || otherChange.objectKey?.split('.').pop();
+            return idxCols.includes(colName);
+          }
+          return false;
+        });
+        
+        if (hasNewColumnDependency && phase < 10) {
+          phase = 10;
+        }
+      }
+      
       if (!phases[phase]) phases[phase] = [];
       phases[phase].push(change);
     }

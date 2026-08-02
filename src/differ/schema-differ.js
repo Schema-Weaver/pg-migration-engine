@@ -293,28 +293,46 @@ export class SchemaDiffer {
         if (!name) continue;
 
         const key = `${tableKey}.${name}`;
-        // Already tracked via the top-level constraints section (desired or
-        // current) - skip to avoid duplicates.
         if (desiredConstraints[key] || currentConstraints[key]) continue;
 
         const schema = tableObj.schema || tableKey.split('.')[0] || 'public';
         const tableName = tableObj.name || tableKey.split('.')[1] || '';
 
-        // Normalize the referenced table to a full key so the dependency
-        // resolver can find the referenced table's CREATE change.
         let refTable = con.referencedTable || con.refTable || '';
         if (refTable && !refTable.includes('.')) {
           refTable = `${con.referencedSchema || con.refSchema || schema}.${refTable}`;
         }
 
-        changes.push(this.createChangeObject(
-          'ADD_FOREIGN_KEY',
-          'constraint',
-          key,
-          null,
-          { ...con, name, schema, tableName, tableKey, referencedTable: refTable, constraintType: 'FOREIGN_KEY' },
-          { constraintType: 'FOREIGN_KEY', name, schema, tableName, referencedTable: refTable }
-        ));
+        const currentFK = currentConstraints[key];
+        
+        if (currentFK) {
+          const props = ['referencedTable', 'referencedColumns', 'columns', 'onDelete', 'onUpdate', 'deferrable', 'initiallyDeferred'];
+          const hasChanges = props.some(prop => {
+            const desiredVal = prop === 'referencedTable' ? refTable : (prop === 'referencedColumns' ? (con.referencedColumns || con.refColumns) : con[prop]);
+            const currentVal = prop === 'referencedTable' ? currentFK.referencedTable : (prop === 'referencedColumns' ? currentFK.referencedColumns : currentFK[prop]);
+            return JSON.stringify(desiredVal) !== JSON.stringify(currentVal);
+          });
+          
+          if (hasChanges) {
+            changes.push(this.createChangeObject(
+              'ALTER',
+              'constraint',
+              key,
+              currentFK,
+              { ...con, name, schema, tableName, tableKey, referencedTable: refTable, constraintType: 'FOREIGN_KEY' },
+              { constraintType: 'FOREIGN_KEY', name, schema, tableName, referencedTable: refTable }
+            ));
+          }
+        } else {
+          changes.push(this.createChangeObject(
+            'ADD_FOREIGN_KEY',
+            'constraint',
+            key,
+            null,
+            { ...con, name, schema, tableName, tableKey, referencedTable: refTable, constraintType: 'FOREIGN_KEY' },
+            { constraintType: 'FOREIGN_KEY', name, schema, tableName, referencedTable: refTable }
+          ));
+        }
       }
     }
 

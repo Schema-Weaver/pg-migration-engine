@@ -26,11 +26,15 @@ export function generateDropSql(change) {
       return `DROP MATERIALIZED VIEW IF EXISTS ${objectKey} CASCADE;`;
 
     case 'function':
-      const fnArgs = obj?.argumentTypes ? `(${obj.argumentTypes.join(', ')})` : '';
+      // objectKey may already carry the signature (e.g. public.fn()) - never
+      // append the argument list twice, which produced invalid "()()" SQL.
+      const fnHasSig = typeof objectKey === 'string' && objectKey.includes('(');
+      const fnArgs = obj?.argumentTypes && !fnHasSig ? `(${obj.argumentTypes.join(', ')})` : '';
       return `DROP FUNCTION IF EXISTS ${objectKey}${fnArgs} CASCADE;`;
 
     case 'procedure':
-      const procArgs = obj?.argumentTypes ? `(${obj.argumentTypes.join(', ')})` : '';
+      const procHasSig = typeof objectKey === 'string' && objectKey.includes('(');
+      const procArgs = obj?.argumentTypes && !procHasSig ? `(${obj.argumentTypes.join(', ')})` : '';
       return `DROP PROCEDURE IF EXISTS ${objectKey}${procArgs} CASCADE;`;
 
     case 'trigger':

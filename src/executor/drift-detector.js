@@ -21,6 +21,7 @@ export class DriftDetector {
         objectsModified: 0,
         objectsCreated: 0,
         objectsDropped: 0,
+        columnsModified: 0,
       },
     };
 
@@ -103,6 +104,64 @@ export class DriftDetector {
       }
     }
 
+    const tablePaths = new Set();
+    // Checksum entries store the pg_class relkind letter ('r', 'p', 'f', ...),
+    // NOT the string 'table' - keyed by `schema.name.kind`.
+    for (const list of [snapshotBefore.checksums, snapshotAfter.checksums]) {
+      for (const c of list || []) {
+        if (c.kind === 'r' || c.kind === 'p' || c.kind === 'f') {
+          tablePaths.add(`${c.schema}.${c.name}`);
+        }
+      }
+    }
+    
+    for (const tablePath of tablePaths) {
+      const columnDrift = this.detectColumnDrift(snapshotBefore, snapshotAfter, tablePath);
+      if (columnDrift.hasDrift) {
+        const columnChanges = (expectedDiff.changes || []).filter(c => 
+          c.objectType === 'column' && c.objectKey?.startsWith(tablePath + '.')
+        );
+        
+        for (const mod of columnDrift.columnsModified) {
+          const colKey = `${tablePath}.${mod.name}`;
+          if (!columnChanges.some(c => c.objectKey === colKey)) {
+            drift.detected = true;
+            drift.unexpectedChanges.push({
+              path: colKey,
+              type: 'column_modified',
+              message: `Column ${colKey} was modified externally`,
+              details: mod,
+            });
+            drift.summary.columnsModified++;
+          }
+        }
+        for (const colName of columnDrift.columnsAdded) {
+          const colKey = `${tablePath}.${colName}`;
+          if (!columnChanges.some(c => c.objectKey === colKey)) {
+            drift.detected = true;
+            drift.unexpectedChanges.push({
+              path: colKey,
+              type: 'column_added',
+              message: `Column ${colKey} was added externally`,
+            });
+            drift.summary.columnsModified++;
+          }
+        }
+        for (const colName of columnDrift.columnsDropped) {
+          const colKey = `${tablePath}.${colName}`;
+          if (!columnChanges.some(c => c.objectKey === colKey)) {
+            drift.detected = true;
+            drift.unexpectedChanges.push({
+              path: colKey,
+              type: 'column_dropped',
+              message: `Column ${colKey} was dropped externally`,
+            });
+            drift.summary.columnsModified++;
+          }
+        }
+      }
+    }
+
     return drift;
   }
 
@@ -156,20 +215,26 @@ export class DriftDetector {
    * @returns {Object}
    */
   getTableColumns(snapshot, tableName) {
-    if (!snapshot?.schemas) return {};
-
-    const parts = tableName.split('.');
-    const schemaName = parts.length > 1 ? parts[0] : 'public';
-    const table = parts.length > 1 ? parts[1] : parts[0];
-
-    const schema = snapshot.schemas[schemaName];
-    if (!schema?.tables) return {};
-
-    const tableObj = schema.tables.find(t => t.name === table);
-    if (!tableObj?.columns) return {};
+    // Canonical introspector snapshots use a flat `tables` map keyed by
+    // "schema.table"; fall back to the nested schemas[schema].tables[] layout
+    // for legacy snapshots.
+    const tableKey = tableName.includes('.') ? tableName : `public.${tableName}`;
+    let table = snapshot?.tables?.[tableKey];
+    if (!table) {
+      const parts = tableName.split('.');
+      const schemaName = parts.length > 1 ? parts[0] : 'public';
+      const name = parts.length > 1 ? parts[1] : parts[0];
+      const schema = snapshot?.schemas?.[schemaName];
+      if (schema?.tables) {
+        table = Array.isArray(schema.tables)
+          ? schema.tables.find(t => t.name === name)
+          : schema.tables[tableKey] || schema.tables[name];
+      }
+    }
+    if (!table?.columns) return {};
 
     const cols = {};
-    for (const col of tableObj.columns) {
+    for (const col of table.columns) {
       cols[col.name] = {
         dataType: col.dataType,
         isNullable: col.isNullable,

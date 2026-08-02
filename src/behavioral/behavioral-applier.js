@@ -345,10 +345,12 @@ export class BehavioralApplier {
       case 'materializedView':
         return `DROP MATERIALIZED VIEW IF EXISTS ${path} CASCADE;`;
       case 'function':
-        const fnArgs = change.before?.argumentTypes ? `(${change.before.argumentTypes.join(', ')})` : '';
+        const fnHasSig = typeof path === 'string' && path.includes('(');
+        const fnArgs = change.before?.argumentTypes && !fnHasSig ? `(${change.before.argumentTypes.join(', ')})` : '';
         return `DROP FUNCTION IF EXISTS ${path}${fnArgs} CASCADE;`;
       case 'procedure':
-        const procArgs = change.before?.argumentTypes ? `(${change.before.argumentTypes.join(', ')})` : '';
+        const procHasSig = typeof path === 'string' && path.includes('(');
+        const procArgs = change.before?.argumentTypes && !procHasSig ? `(${change.before.argumentTypes.join(', ')})` : '';
         return `DROP PROCEDURE IF EXISTS ${path}${procArgs} CASCADE;`;
       case 'trigger':
         const tableName = change.before?.tableName;

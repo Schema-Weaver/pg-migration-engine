@@ -13,10 +13,10 @@ import { InputValidationError } from '../errors.js';
  * and detecting potential renames.
  */
 
-const RENAME_SIMILARITY_THRESHOLD = 0.15;
+const RENAME_SIMILARITY_THRESHOLD = 0.60;
 const HIGH_CONFIDENCE_THRESHOLD = 0.80;
-const MEDIUM_CONFIDENCE_THRESHOLD = 0.55;
-const LOW_CONFIDENCE_THRESHOLD = 0.35;
+const MEDIUM_CONFIDENCE_THRESHOLD = 0.70;
+const LOW_CONFIDENCE_THRESHOLD = 0.60;
 
 export class ObjectMatcher {
   constructor() {
@@ -56,7 +56,31 @@ export class ObjectMatcher {
     this.matchObjects(desired.types, current.types, 'type', result, desired, current);
     this.matchObjects(desired.extensions, current.extensions, 'extension', result, desired, current);
     this.matchObjects(desired.indexes, current.indexes, 'index', result, desired, current);
-    this.matchObjects(desired.constraints, current.constraints, 'constraint', result, desired, current);
+    
+    const filteredCurrentConstraints = {};
+    
+    for (const [key, constraint] of Object.entries(current.constraints || {})) {
+      if (constraint.constraintType !== 'NOT_NULL' && constraint.type !== 'not_null') {
+        filteredCurrentConstraints[key] = constraint;
+      }
+    }
+    
+    // Preserve the "no intent" semantics for the constraints section. When the
+    // desired snapshot omits the top-level `constraints` key entirely, the
+    // user is not managing constraints explicitly (they are nested inside the
+    // table definitions), so live PK/FK/NOT NULL constraints must never be
+    // turned into drops. `matchObjects()` returns early for an undefined map.
+    let filteredDesiredConstraints;
+    if (desired.constraints !== undefined && desired.constraints !== null) {
+      filteredDesiredConstraints = {};
+      for (const [key, constraint] of Object.entries(desired.constraints)) {
+        if (constraint.constraintType !== 'NOT_NULL' && constraint.type !== 'not_null') {
+          filteredDesiredConstraints[key] = constraint;
+        }
+      }
+    }
+    
+    this.matchObjects(filteredDesiredConstraints, filteredCurrentConstraints, 'constraint', result, desired, current);
     this.matchObjects(desired.statistics, current.statistics, 'statistics', result, desired, current);
     this.matchObjects(desired.collations, current.collations, 'collation', result, desired, current);
     this.matchObjects(desired.operators, current.operators, 'operator', result, desired, current);
@@ -237,8 +261,16 @@ export class ObjectMatcher {
       // Must be in same schema
       if (drop.schema !== create.schema) return false;
 
-      // Must have same parent (for child objects like columns, triggers)
-      if (drop.parent && create.parent && drop.parent !== create.parent) return false;
+      // Must have same parent (for child objects like columns, triggers).
+      // Desired snapshots may carry an unqualified table name (e.g. "tbl")
+      // while introspection reports the qualified path (e.g. "e15.tbl");
+      // schema equality above already guarantees the namespace, so compare
+      // the final path segment.
+      if (drop.parent && create.parent) {
+        const dropParent = String(drop.parent).split('.').pop();
+        const createParent = String(create.parent).split('.').pop();
+        if (dropParent !== createParent) return false;
+      }
 
       // Name similarity must be above threshold
       if (!isSimilarEnough(drop.name, create.name, RENAME_SIMILARITY_THRESHOLD)) return false;

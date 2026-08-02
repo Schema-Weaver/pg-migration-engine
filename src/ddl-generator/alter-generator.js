@@ -295,8 +295,31 @@ function generateAlterColumnSql(change) {
 
   switch (property) {
     case 'dataType':
-      const using = change.usingExpression || `${col}::${change.desiredValue}`;
-      return `ALTER TABLE ${table} ALTER COLUMN ${ident(col)} TYPE ${change.desiredValue} USING ${using};`;
+      // Qualify non-standard (user-defined) types with the table's schema.
+      // Mirrors create-generator.js so that ALTER COLUMN TYPE and CREATE TABLE
+      // agree: e.g. "g5"."status" instead of a bare "status" that fails to
+      // resolve when search_path is "public".
+      const rawType = change.desiredValue;
+      const rawTypeStr = String(rawType || '');
+      const lowerType = rawTypeStr.toLowerCase();
+      const isStdType = lowerType.startsWith('character varying') ||
+        lowerType.startsWith('varchar') ||
+        lowerType.startsWith('char') ||
+        lowerType.startsWith('numeric') ||
+        lowerType.startsWith('decimal') ||
+        lowerType.startsWith('timestamp') ||
+        ['bigint', 'integer', 'int', 'smallint', 'boolean', 'bool', 'text', 'date', 'uuid', 'json', 'jsonb', 'bytea', 'real', 'double precision'].some(t => lowerType.startsWith(t)) ||
+        rawTypeStr.endsWith('[]');
+      let typeRef = rawTypeStr;
+      if (!isStdType && !rawTypeStr.includes('.')) {
+        const colSchema = change.schema || (parts.length > 0 ? parts[0] : undefined);
+        const typeSchema = change.dataTypeSchema || (change.after?.dataTypeSchema || change.after?.udtSchema) || colSchema;
+        if (typeSchema && typeSchema !== 'pg_catalog' && typeSchema !== 'public') {
+          typeRef = `${ident(typeSchema)}.${ident(rawTypeStr)}`;
+        }
+      }
+      const using = change.usingExpression || `${col}::${typeRef}`;
+      return `ALTER TABLE ${table} ALTER COLUMN ${ident(col)} TYPE ${typeRef} USING ${using};`;
 
     case 'isNullable':
       if (change.desiredValue) {
@@ -869,18 +892,19 @@ function escapeDefaultValue(defaultVal) {
   if (str === '') return "''";
   if (str.toUpperCase() === 'NULL') return 'NULL';
   
-  // Check if it's already dollar-quoted
+  // Check if it's already dollar-quoted (user provided safe format)
   if (str.startsWith('$$') && str.endsWith('$$')) {
     return str;
   }
   
   // Check if it's already single-quoted
   if (str.startsWith("'") && str.endsWith("'")) {
+    // Validate and re-escape the contents
     const inner = str.slice(1, -1);
     return `'${inner.replace(/'/g, "''")}'`;
   }
   
-  // PostgreSQL keywords/functions that should not be quoted
+  // Check if it's a PostgreSQL keyword/function that should not be quoted
   const noQuoteKeywords = [
     'TRUE', 'FALSE',
     'NOW()', 'CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_TIME',
@@ -892,12 +916,28 @@ function escapeDefaultValue(defaultVal) {
     return str;
   }
   
-  // Numbers should not be quoted
+  // Check if it's a number (integers and floats)
   if (/^-?\d+(\.\d+)?$/.test(str)) {
     return str;
   }
   
-  // Default: treat as string literal
+  // Check if it's a PostgreSQL function call or expression
+  // Functions: func_name(), func_name(args)
+  if (/^[a-z_][a-z0-9_]*\s*\(/i.test(str) || 
+      str.toUpperCase().includes('::') || 
+      str.includes('ARRAY[') ||
+      str.includes('[]') ||
+      str.includes('+') ||
+      str.includes('-') && str.includes('interval')) {
+    // This might be intentional SQL expression - pass through but warn
+    console.warn(
+      `[Security] Default value "${str.substring(0, 50)}${str.length > 50 ? '...' : ''}" ` +
+      `appears to be a SQL expression. Ensure this is intentional.`
+    );
+    return str;
+  }
+  
+  // Default: treat as string literal, escape single quotes and wrap
   return `'${str.replace(/'/g, "''")}'`;
 }
 

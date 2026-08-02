@@ -53,17 +53,49 @@ export class RollbackGenerator {
     }
 
     const changes = [...diff.changes].reverse();
+    
+    const renameMap = new Map();
+    for (const change of changes) {
+      if (change.changeType === 'RENAME') {
+        const oldKey = change.objectKey;
+        const newKey = change.after?.name ? 
+          `${change.schema}.${change.after.name}` : 
+          change.objectKey.replace(change.before?.name || '', change.after?.name || '');
+        renameMap.set(change.objectKey, { newKey, newName: change.after?.name });
+      }
+    }
 
     for (const change of changes) {
+      let objectKey = change.objectKey || change.path;
+      
+      for (const [oldKey, renameInfo] of renameMap.entries()) {
+        if (objectKey.startsWith(oldKey.split('.').slice(0, -1).join('.'))) {
+          const expectedOldName = oldKey.split('.').pop();
+          if (change.before?.name === renameInfo.newName || objectKey.includes(renameInfo.newName || '')) {
+            return [{
+              sql: `-- ⚠️ IRREVERSIBLE: Cannot rollback - object was renamed by later migration. Rollback later migrations first.`,
+              originalChangeId: change.id,
+              changeType: change.changeType,
+              objectKey: objectKey,
+              isTransactional: false,
+              isIrreversible: true,
+              reason: 'chained_rename'
+            }];
+          }
+        }
+      }
+      
       const undoSQL = this.generateUndoForChange(change);
       if (undoSQL) {
         const isNonTransactional = this.isNonTransactionalRollback(change, undoSQL);
+        const isIrreversible = undoSQL.startsWith('--') && (undoSQL.includes('IRREVERSIBLE') || undoSQL.includes('IMPOSSIBLE') || undoSQL.includes('CANNOT'));
         rollbackSteps.push({
           sql: undoSQL,
           originalChangeId: change.id,
           changeType: change.changeType,
-          objectKey: change.objectKey || change.path,
+          objectKey: objectKey,
           isTransactional: !isNonTransactional,
+          isIrreversible: isIrreversible,
         });
       }
     }
@@ -119,9 +151,15 @@ export class RollbackGenerator {
           return this.generateUndoForDrop(change, objectType, path);
         }
         if (changeType === 'ADD_ENUM_VALUES') {
-          return `-- ⚠️ IMPOSSIBLE ROLLBACK: PostgreSQL does not support removing enum values. The value '${change.value || change.addedValues?.join(', ') || 'unknown'}' was added to ${path} and cannot be removed without recreating the entire enum type.`;
+          return `-- ⚠️ IRREVERSIBLE: PostgreSQL does not support removing enum values. The value '${change.value || change.addedValues?.join(', ') || 'unknown'}' was added to ${path} and cannot be removed without recreating the entire enum type.`;
         }
-        return `-- CANNOT AUTO-ROLLBACK: Unknown change type "${changeType}" for ${path}`;
+        if (changeType === 'WIDENING_CAST' || changeType === 'NARROWING_CAST') {
+          return this.generateTypeCastRollback(change, path);
+        }
+        if (changeType === 'REMOVE_ENUM_VALUES') {
+          return `-- ⚠️ IRREVERSIBLE: Cannot restore removed enum values on ${path} - requires full type recreation`;
+        }
+        return `-- ⚠️ IRREVERSIBLE: Unknown change type "${changeType}" for ${path}`;
     }
   }
 
@@ -533,6 +571,29 @@ export class RollbackGenerator {
     return sql + ';';
   }
 
+  generateTypeCastRollback(change, path) {
+    const parts = path.split('.');
+    const col = parts.pop();
+    const table = parts.join('.');
+    const beforeType = change.before?.dataType || change.currentValue;
+    const afterType = change.after?.dataType || change.desiredValue;
+    
+    if (!beforeType || !afterType || beforeType === afterType) {
+      return `-- ⚠️ IRREVERSIBLE: Cannot rollback type cast on ${path} - original type not available`;
+    }
+    
+    const usingExpr = `"${col}"::${beforeType}`;
+    const needsUsing = this.typeCastNeedsUsing(afterType, beforeType);
+    
+    let sql = `ALTER TABLE ${table} ALTER COLUMN "${col}" TYPE ${beforeType}`;
+    
+    if (needsUsing) {
+      sql += ` USING ${usingExpr}`;
+    }
+    
+    return sql + ';';
+  }
+
   /**
    * Determine if type cast requires explicit USING clause
    */
@@ -643,7 +704,6 @@ export class RollbackGenerator {
         return { possible: false, reason: 'Data loss - cannot recover dropped data' };
       }
       
-      // FIX: Check if before state is available
       if (change.before && Object.keys(change.before).length > 0) {
         return { 
           possible: true, 
@@ -657,6 +717,14 @@ export class RollbackGenerator {
 
     if (changeType === 'ADD_ENUM_VALUES') {
       return { possible: false, reason: 'PostgreSQL cannot remove enum values without recreating type' };
+    }
+
+    if (changeType === 'RENAME') {
+      return { 
+        possible: true, 
+        reason: 'Rename can be reversed',
+        warning: 'Check that later migrations do not reference the new name'
+      };
     }
 
     return { possible: true, reason: 'Rollback available' };

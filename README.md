@@ -6,6 +6,8 @@
 
 **PostgreSQL schema introspection, diff, DDL generation, and safe migration execution.**
 
+[Why This Exists](#why-this-exists) • [Supported Objects](#supported-object-types-50) • [Architecture](#architecture) • [Installation](#installation) • [Quick Start](#quick-start) • [Schema Format](#schema-format) • [Key Features](#key-features) • [API Reference](#api-reference) • [Documentation](#documentation)
+
 ---
 
 ## Why This Exists
@@ -14,10 +16,10 @@ No existing open-source tool covers PostgreSQL object types comprehensively:
 
 | Tool | Coverage | Limitations |
 |------|----------|-------------|
-| pgAdmin | UI only | No programmatic API, no diff |
-| Atlas | ~15 types | Missing views, functions, triggers, policies |
-| Prisma | ~10 types | Ignores behavioral objects entirely |
-| Django Migrations | ~12 types | ORM-specific, limited DDL control |
+| DataGrip / DBeaver / pgAdmin | GUI only | No programmatic API or CLI, manual UI workflow |
+| Flyway / Liquibase | Manual SQL | No state-based diff engine — developers write all DDL by hand |
+| Atlas | ~15 types | Missing PG behavioral objects (views, functions, triggers, policies) |
+| Prisma / Drizzle | ~10 types | ORM-bound; ignores PG-native types, procedures, and behavioral objects |
 
 **This engine covers EVERYTHING** — 50+ object types with extensive property coverage.
 
@@ -25,93 +27,21 @@ No existing open-source tool covers PostgreSQL object types comprehensively:
 
 ## Supported Object Types (50+)
 
-### Track 1: Structural Objects
+Covers **50+ PostgreSQL object types** and **190+ properties** across PostgreSQL 10–18:
 
-| Type | Category | Coverage |
-|------|----------|----------|
-| Table | Core | Full |
-| Column | Core | Full |
-| Index | Core | Full |
-| Constraint (PK/FK/UNIQUE/CHECK/EXCLUSION) | Core | Full |
-| Sequence | Core | Full |
-| Enum Type | Type System | Full |
-| Composite Type | Type System | Full |
-| Domain Type | Type System | Full |
-| Range Type | Type System | Full |
-| Multirange Type | Type System (PG14+) | Full |
-| Schema | Container | Full |
-| Extension | Package | Full |
-| Statistics | Optimizer | Full |
-| Partition | Table Property | Full |
-| Collation | Locale | ~90% |
-| Cast | Type System | Full |
-| Operator | Advanced | Full |
-| Operator Class | Advanced | Full |
-| Operator Family | Advanced | Full |
-| Access Method | Storage | Full |
-| Foreign Table | FDW | Full |
-| Default Privileges | ACL | Full |
+- **Structural Objects:** Tables, Columns, Indexes, Constraints, Sequences, Enums, Domains, Ranges, Partitions, Foreign Tables, ACLs, and more.
+- **Behavioral Objects:** Views, Materialized Views, Functions, Procedures, Triggers, RLS Policies, Text Search (FTS), Rules, FDWs.
+- **Cross-Database Objects:** Databases, Roles, Tablespaces, Publications, Subscriptions.
 
-### Track 2: Behavioral Objects
-
-| Type | Category | Coverage |
-|------|----------|----------|
-| View | Query | Full |
-| Materialized View | Query | Full |
-| Function | Procedural | Full |
-| Procedure | Procedural (PG11+) | Full |
-| Aggregate | Procedural | Full |
-| Trigger | Automation | Full |
-| Event Trigger | Automation | Full |
-| Policy | RLS | Full |
-| Rule | Rewrite | Full |
-| Text Search Config | FTS | Full |
-| Text Search Dictionary | FTS | Full |
-| Text Search Parser | FTS | Full |
-| Text Search Template | FTS | Full |
-| Conversion | Encoding | Full |
-| Foreign Data Wrapper | FDW | Full |
-| Foreign Server | FDW | Full |
-| User Mapping | FDW | Full |
-
-### Track 3: Cross-Database Objects
-
-| Type | Category | Coverage |
-|------|----------|----------|
-| Database | Instance | Full |
-| Tablespace | Storage | Full |
-| Role | Auth | Full |
-| Publication | Replication | Full |
-| Subscription | Replication | Full |
-
-**Overall: 190+ properties tracked across PG10–PG18**
+👉 *See full breakdown and property matrix in [Supported Objects Wiki](https://github.com/Schema-Weaver/pg-migration-engine/wiki/Supported-Objects).*
 
 ---
 
-## Architecture (8 Modules)
+## Architecture
 
-```
-SQL ──► Introspector ──► Translator ──► Differ ──► DDL Generator ──► Planner ──► Executor
-                                │                      │                         │
-                                ▼                      ▼                         ▼
-                           Risk Tagger          Safe Patterns              Storage
-                       (assess change risk)                              (history)
-                                                                          │
-                                                                          ▼
-                                                                    Behavioral
-                                                                  (views/fns/triggers)
-```
+`SQL` ➔ **Introspector** ➔ **Translator** ➔ **Differ** ➔ **Risk Tagger** ➔ **DDL Generator** ➔ **Planner** ➔ **Executor** ➔ **Storage**
 
-| Module | Purpose |
-|--------|---------|
-| **Introspector** | Queries `pg_catalog` for 50+ object types |
-| **Translator** | Normalizes raw PG rows into canonical schema model |
-| **Differ** | Detects CREATE/ALTER/DROP/RENAME with property-level diff |
-| **Risk Tagger** | 5-level risk assessment per change |
-| **DDL Generator** | Generates safe DDL with 6+ safe patterns |
-| **Planner** | Dependency-ordered, phase-based plan (Track 1 → Track 2) |
-| **Executor** | Advisory locks, savepoints, drift detection, progress |
-| **Storage** | Migration history (PostgreSQL / Memory / File / GitHub backends) |
+👉 *Explore the 8-module deep dive in [Architecture Wiki](https://github.com/Schema-Weaver/pg-migration-engine/wiki/Architecture).*
 
 ---
 
@@ -166,150 +96,51 @@ const result = await engine.migrate(pool, desired);
 
 ## Schema Format
 
-The `desired` schema can be provided in two formats:
-
-### Object Format (Recommended)
+The engine accepts desired schemas in either **Object Format** (keyed by name) or **Array Format** (automatically normalized):
 
 ```javascript
+import { normalizeSchema, validateSchemaFormat } from 'pg-migration-engine';
+
+// Object Format (Recommended) or Array Format
 const desired = {
   tables: {
     'public.users': {
       name: 'users',
       schema: 'public',
       columns: [
-        { name: 'id', dataType: 'serial', isNullable: false },
+        { name: 'id', dataType: 'serial', isNullable: false }, // accepts 'dataType' or 'type'
         { name: 'email', dataType: 'varchar(255)', isNullable: false },
-        { name: 'created_at', dataType: 'timestamp', isNullable: false },
+        { name: 'created_at', dataType: 'timestamp', isNullable: false, defaultValue: 'now()' },
       ],
       constraints: [
         { name: 'users_pkey', constraintType: 'PRIMARY_KEY', columns: ['id'] },
-        { name: 'users_email_unique', constraintType: 'UNIQUE', columns: ['email'] },
       ],
     },
   },
   types: {
-    'public.status': {
-      name: 'status',
-      schema: 'public',
-      kind: 'ENUM',
-      enumValues: ['draft', 'published', 'archived'],
-    },
+    'public.status': { name: 'status', schema: 'public', kind: 'ENUM', enumValues: ['draft', 'active'] },
   },
   indexes: {
-    'public.users_email_idx': {
-      name: 'users_email_idx',
-      schema: 'public',
-      table: 'users',
-      columns: [{ name: 'email' }],
-    },
+    'public.users_email_idx': { name: 'users_email_idx', table: 'users', columns: ['email'] }, // accepts strings or objects
   },
 };
-```
 
-### Array Format (Auto-converted)
-
-```javascript
-// Arrays are automatically converted to object format
-const desired = {
-  tables: [
-    { name: 'users', columns: [{ name: 'id', type: 'serial' }] },
-  ],
-  types: [
-    { name: 'status', kind: 'ENUM', enumValues: ['active', 'inactive'] },
-  ],
-  indexes: [
-    { name: 'email_idx', table: 'users', columns: ['email'] }, // strings auto-converted
-  ],
-};
-```
-
-### Column Format
-
-Columns accept both `dataType` and `type`:
-
-```javascript
-// Both work:
-{ name: 'id', dataType: 'serial' }
-{ name: 'id', type: 'serial' }
-
-// Full example:
-{ 
-  name: 'created_at', 
-  dataType: 'timestamp', 
-  isNullable: false,
-  defaultValue: 'now()'
-}
-```
-
-### Index Columns
-
-Index columns can be strings or objects:
-
-```javascript
-// All work:
-columns: ['email', 'name']
-columns: [{ name: 'email' }, { name: 'name' }]
-columns: [{ expression: 'lower(email)' }]
-```
-
-### Normalization Helper
-
-```javascript
-import { normalizeSchema, validateSchemaFormat } from 'pg-migration-engine';
-
-// Normalize array format to object format
-const normalized = normalizeSchema(schema);
-
-// Validate schema format
-const { valid, errors } = validateSchemaFormat(schema);
-if (!valid) {
-  console.error('Schema errors:', errors);
-}
+// Normalize array format & validate
+const normalized = normalizeSchema(desired);
+const { valid, errors } = validateSchemaFormat(desired);
 ```
 
 ---
 
 ## Key Features
 
-### 50+ PostgreSQL Object Types
-Most comprehensive coverage available. See [Supported Objects](https://github.com/Schema-Weaver/pg-migration-engine/wiki/Supported-Objects).
-
-### PG 10–18 Support
-Version-gated queries automatically adapt to your PostgreSQL version.
-
-### Safe Migration Patterns (6+ patterns)
-
-| Pattern | How It Works |
-|---------|--------------|
-| **NOT NULL** | 3-step: CHECK(NOT VALID) → validate → SET NOT NULL |
-| **FK Constraint** | ADD NOT VALID → validate separately |
-| **Index** | CREATE INDEX CONCURRENTLY for zero-downtime |
-| **Enum ADD VALUE** | Pre-transaction for PG < 14 |
-| **UNIQUE constraint** | CREATE UNIQUE INDEX CONCURRENTLY → ADD CONSTRAINT USING INDEX |
-| **CHECK constraint** | ADD NOT VALID → validate separately |
-| **Type change** | ALTER TYPE with USING clause for explicit conversion |
-
-### 5-Level Risk Assessment
-
-| Level | Examples | Default |
-|-------|----------|---------|
-| `none` | CREATE TABLE, ADD nullable column | ✅ Allow |
-| `low` | ADD COLUMN with default, CREATE INDEX | ✅ Allow |
-| `medium` | ALTER COLUMN type (widening) | ✅ Allow |
-| `high` | DROP INDEX, ALTER type (narrowing) | ❌ Block |
-| `critical` | DROP TABLE, DROP COLUMN | ❌ Block |
-
-### RENAME Detection
-Smart matching detects renames instead of DROP+CREATE, preserving data.
-
-### Drift Detection
-Fingerprint-based schema drift alerts when database changed outside migrations.
-
-### Rollback Generation
-Automatic reverse DDL for supported changes.
-
-### Non-Transactional Aware
-Handles `ALTER ENUM ADD VALUE`, `CREATE INDEX CONCURRENTLY`, `REINDEX CONCURRENTLY` outside transactions.
+- **50+ Object Types (PG 10–18):** Full introspection & state-based diffing across all PostgreSQL structural, behavioral, and cross-database objects.
+- **Safe Migration Patterns:** Automated non-blocking DDL workflows for zero-downtime changes (`CONCURRENTLY` indexes, `NOT VALID` constraints, lock-free `NOT NULL`). See [Safe Patterns Wiki](https://github.com/Schema-Weaver/pg-migration-engine/wiki/Safe-Migration-Patterns).
+- **5-Level Risk Assessment:** Categorizes change safety (`none` to `critical`); destructive operations (`DROP TABLE`, `DROP COLUMN`) blocked by default. See [Risk Assessment Wiki](https://github.com/Schema-Weaver/pg-migration-engine/wiki/Risk-Assessment).
+- **RENAME Detection:** Smart entity matching detects renames instead of destructive `DROP` + `CREATE`, preserving data.
+- **Drift Detection:** Fingerprint-based schema checksums alert when database state is altered out-of-band outside migrations.
+- **Non-Transactional Aware:** Automatically isolates statements requiring outside-transaction execution (`ALTER ENUM ADD VALUE`, `CREATE INDEX CONCURRENTLY`).
+- **Rollback Generation:** Generates automatic reverse DDL statements for safe migration rollbacks.
 
 ---
 
@@ -337,7 +168,7 @@ Full API: [API Reference](https://github.com/Schema-Weaver/pg-migration-engine/w
 |---------|---------|
 | **[sw-agent](https://www.npmjs.com/package/@vivekmind/sw-agent)** | PostgreSQL connection pool, security, audit |
 | **[pg-ddl-parser](https://www.npmjs.com/package/pg-ddl-parser)** | DDL parsing (CREATE/ALTER/DROP → schema) |
-| **pg-migration-engine** | Schema introspection, diff, migration |
+| **[pg-migration-engine](https://www.npmjs.com/package/pg-migration-engine)** | Schema introspection, diff, migration |
 
 ```javascript
 import { parsePostgresSQL } from 'pg-ddl-parser';
@@ -350,21 +181,6 @@ const desired = parsePostgresSQL(fs.readFileSync('schema.sql', 'utf8'));
 const engine = new SwMigrationEngine();
 await engine.migrate(pool, convertParsedToSnapshot(desired));
 ```
-
----
-
-## Test Results
-
-| Layer | Test | Assertions | Result |
-|-------|------|------------|--------|
-| 1 | Introspection Accuracy | 93 | ✅ 100% PASS |
-| 2 | Diff Detection | — | ✅ PASS |
-| 3 | E2E Pipeline | 12 | ✅ 100% PASS |
-| 4 | Planner Order | — | ✅ Phase order verified |
-| 5 | Execution | — | Partial — needs production |
-| 6 | Recovery | — | Pending |
-
-Tested against **PostgreSQL 18.1** with a 25-table, 4-schema, 1052-object database.
 
 ---
 

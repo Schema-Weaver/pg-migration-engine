@@ -703,7 +703,8 @@ function generateCreateTriggerSql(trig) {
       sql += ` DEFERRABLE INITIALLY ${trig.deferred ? 'DEFERRED' : 'IMMEDIATE'}`;
     }
   } else {
-    sql += ` FOR EACH ${trig.isForEachRow ? 'ROW' : 'STATEMENT'}`;
+    const granular = trig.level || (trig.isForEachRow ? 'ROW' : 'STATEMENT');
+    sql += ` FOR EACH ${granular}`;
   }
   
   if (trig.condition) sql += ` WHEN (${trig.condition})`;
@@ -737,7 +738,18 @@ function generateCreateIndexSql(idx) {
     if (idx.isConcurrent) sql += ' CONCURRENTLY';
     
     const ifNotExists = idx.ifNotExists !== false && !idx.isConcurrent ? 'IF NOT EXISTS ' : '';
-    sql += ` ${ifNotExists}${ident(idx.name)} ON ${ident(idx.schema)}.${ident(idx.table)}`;
+    
+    const tableIdent = (() => {
+      if (!idx.table) return '';
+      const tableStr = String(idx.table);
+      if (tableStr.includes('.') && tableStr.split('.').length === 2) {
+        const parts = tableStr.split('.');
+        return `${ident(parts[0])}.${ident(parts[1])}`;
+      }
+      return `${ident(idx.schema)}.${ident(tableStr)}`;
+    })();
+    
+    sql += ` ${ifNotExists}${ident(idx.name)} ON ${tableIdent}`;
     
     if (idx.accessMethod && idx.accessMethod !== 'btree') {
       sql += ` USING ${idx.accessMethod}`;

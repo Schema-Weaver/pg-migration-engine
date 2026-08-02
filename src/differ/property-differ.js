@@ -281,7 +281,10 @@ export class PropertyDiffer {
   diffColumn(desired, current, key) {
     const changes = [];
 
-    // Column properties
+    if (desired.default !== undefined && desired.defaultValue === undefined) {
+      desired.defaultValue = desired.default;
+    }
+
     const props = [
       { name: 'dataType', critical: true },
       { name: 'isNullable', critical: false },
