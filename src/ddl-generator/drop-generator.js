@@ -40,7 +40,7 @@ export function generateDropSql(change) {
     case 'trigger':
       const trigTable = obj?.tableName || objectKey.split('.').slice(0, -1).join('.');
       const trigName = obj?.name || objectKey.split('.').pop();
-      return `DROP TRIGGER IF EXISTS ${ident(trigName)} ON ${trigTable};`;
+      return `DROP TRIGGER IF EXISTS ${ident(trigName)} ON ${quoteQualified(trigTable)};`;
 
     case 'index':
       if (changeType === 'DROP_INDEX_CONCURRENTLY' || obj?.isConcurrent) {
@@ -51,12 +51,12 @@ export function generateDropSql(change) {
     case 'constraint':
       const conTable = obj?._tableKey || obj?.tableKey || objectKey.split('.').slice(0, -1).join('.');
       const conName = obj?.name || objectKey.split('.').pop();
-      return `ALTER TABLE ${conTable} DROP CONSTRAINT IF EXISTS ${ident(conName)};`;
+      return `ALTER TABLE ${quoteQualified(conTable)} DROP CONSTRAINT IF EXISTS ${ident(conName)};`;
 
     case 'policy':
       const polTable = obj?.table || objectKey.split('.').slice(0, -1).join('.');
       const polName = obj?.name || objectKey.split('.').pop();
-      return `DROP POLICY IF EXISTS ${ident(polName)} ON ${polTable};`;
+      return `DROP POLICY IF EXISTS ${ident(polName)} ON ${quoteQualified(polTable)};`;
 
     case 'sequence':
       return `DROP SEQUENCE IF EXISTS ${objectKey} CASCADE;`;
@@ -73,7 +73,7 @@ export function generateDropSql(change) {
     case 'rule':
       const ruleTable = obj?.tableName || objectKey.split('.').slice(0, -1).join('.');
       const ruleName = obj?.name || objectKey.split('.').pop();
-      return `DROP RULE IF EXISTS ${ident(ruleName)} ON ${ruleTable};`;
+      return `DROP RULE IF EXISTS ${ident(ruleName)} ON ${quoteQualified(ruleTable)};`;
 
     case 'aggregate':
       const aggArgs = obj?.argumentTypes ? `(${obj.argumentTypes.join(', ')})` : '()';
@@ -141,7 +141,7 @@ export function generateDropSql(change) {
     case 'column':
       const colTable = objectKey.split('.').slice(0, -1).join('.');
       const colName = objectKey.split('.').pop();
-      return `ALTER TABLE ${colTable} DROP COLUMN IF EXISTS ${ident(colName)};`;
+      return `ALTER TABLE ${quoteQualified(colTable)} DROP COLUMN IF EXISTS ${ident(colName)};`;
 
     case 'database':
       return `-- DROP DATABASE must be run outside transaction: DROP DATABASE IF EXISTS ${ident(obj?.name || objectKey)};`;
@@ -199,4 +199,12 @@ function ident(name) {
     return `"${name.replace(/"/g, '""')}"`;
   }
   return `"${name}"`;
+}
+
+function quoteQualified(name) {
+  if (!name) return '';
+  if (typeof name !== 'string') name = String(name);
+  // Already-quoted (contains a `"`): return verbatim — do not re-quote or split.
+  if (name.includes('"')) return name;
+  return name.split('.').map(ident).join('.');
 }

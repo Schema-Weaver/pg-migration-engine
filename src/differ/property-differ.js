@@ -330,9 +330,13 @@ export class PropertyDiffer {
       if (desired[prop.name] === undefined) continue;
       // dataType is compared via type normalization so aliases are equal
       // (varchar(255) vs character varying(255), int vs integer, ...).
+      // storage is compared via a letter-aware normalizer so introspection's
+      // pg_attribute code (p/m/e/x) equals the full keyword (PLAIN/MAIN/...).
       const differs = prop.name === 'dataType'
         ? !typesEqual(desired[prop.name], current[prop.name])
-        : JSON.stringify(desired[prop.name]) !== JSON.stringify(current[prop.name]);
+        : prop.name === 'storage'
+          ? !storagesEqual(desired[prop.name], current[prop.name])
+          : JSON.stringify(desired[prop.name]) !== JSON.stringify(current[prop.name]);
       if (differs) {
         changes.push(this.createPropertyChange('column', key, prop.name, current[prop.name], desired[prop.name]));
       }
@@ -1199,4 +1203,24 @@ export class PropertyDiffer {
     }
     return null;
   }
+}
+
+/**
+ * Compare two column storage values treating the pg_attribute letter code
+ * (p/m/e/x) and the full keyword (PLAIN/MAIN/EXTERNAL/EXTENDED) as equal.
+ */
+function normalizeStorageValue(value) {
+  if (value === null || value === undefined) return null;
+  const raw = String(value).trim();
+  const STORAGE_WORDS = { p: 'PLAIN', m: 'MAIN', e: 'EXTERNAL', x: 'EXTENDED' };
+  const upper = raw.toUpperCase();
+  return STORAGE_WORDS[upper.toLowerCase()] || upper;
+}
+
+function storagesEqual(a, b) {
+  if (a === b) return true;
+  const na = normalizeStorageValue(a);
+  const nb = normalizeStorageValue(b);
+  if (na === null || nb === null) return false;
+  return na === nb;
 }

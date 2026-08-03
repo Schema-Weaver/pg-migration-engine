@@ -36,36 +36,11 @@ export class SchemaDiffer {
   diff(desired, current) {
     const startTime = Date.now();
 
-    // Early exit for identical schemas
-    if (desired.checksum && current.checksum && desired.checksum === current.checksum) {
-      return {
-        summary: {
-          totalChanges: 0,
-          creates: 0,
-          drops: 0,
-          alters: 0,
-          renames: 0,
-          recreates: 0,
-          replaces: 0,
-          byTrack: { track1: { count: 0, phases: {} }, track2: { count: 0, phases: {} } },
-          byPhase: {},
-          byObjectType: {},
-          riskSummary: { critical: 0, high: 0, medium: 0, low: 0, none: 0, categories: {} },
-          requiresDowntime: false,
-          estimatedDuration: '0 seconds',
-        },
-        changes: [],
-        warnings: [],
-        dependencyGraph: { nodes: [], edges: [] },
-        metadata: {
-          diffDuration: Date.now() - startTime,
-          pgVersion: this.pgVersion,
-          desiredChecksum: desired.checksum,
-          currentChecksum: current.checksum,
-          earlyExit: true,
-        },
-      };
-    }
+    // Note: a matching desired/current checksum is deliberately NOT used as a
+    // short-circuit here. Desired snapshots are often built by cloning an
+    // introspected snapshot (keeping its stale checksum) and then editing, so a
+    // checksum match does NOT prove the schemas are equal. The real diff below is
+    // the source of truth; an unchanged schema naturally yields zero changes.
 
     const allChanges = [];
 
@@ -82,6 +57,21 @@ export class SchemaDiffer {
     // Step 2: Handle creates (objects only in desired)
     for (const create of matched.creates) {
       allChanges.push(this.createChangeObject('CREATE', create.objectType, create.key, null, create.object, create));
+
+      // Bug 7: a newly created sequence must also acquire its OWNED BY link, but
+      // only after the owning table (and its column) exist. CREATE SEQUENCE runs
+      // at phase 5 — before the table at 6/7 — so generateCreateSequenceSql omits
+      // OWNED BY. Emit a separate ALTER SEQUENCE ... OWNED BY change (phase 8)
+      // to close the gap; without it the sequence is orphaned forever.
+      if (create.objectType === 'sequence' && create.object?.ownedBy) {
+        const ownedByChange = this.createChangeObject(
+          'ALTER', 'sequence', create.key, null, create.object,
+          { property: 'ownedBy' }, 'ownedBy'
+        );
+        ownedByChange.currentValue = undefined;
+        ownedByChange.desiredValue = create.object.ownedBy;
+        allChanges.push(ownedByChange);
+      }
     }
 
     // Step 3: Handle drops (objects only in current)
@@ -93,6 +83,13 @@ export class SchemaDiffer {
     for (const rename of matched.renames) {
       allChanges.push(this.createChangeObject('RENAME', rename.objectType, rename.key, rename, rename, rename, rename));
     }
+
+    // Step 4.5: Mark constraint creates whose parent table is being created in
+    // the same diff as inline. CREATE TABLE renders those constraints inline, so
+    // generateCreateConstraintSql must not also emit a standalone ADD CONSTRAINT
+    // (duplicate_object). The marking is limited to genuine inline-creation cases:
+    // a constraint on an already-existing table is always a standalone ADD.
+    this.markInlineConstraintCreates(allChanges);
 
     // Step 5: Property-level diff for matched objects
     const propertyResults = this.propertyDiffer.diff(matched.matches, desired, current);
@@ -337,6 +334,37 @@ export class SchemaDiffer {
     }
 
     return changes;
+  }
+
+  /**
+   * Mark CREATE constraint changes as inline when their parent table is created
+   * in the same diff. PostgreSQL auto-generated constraint names look identical
+   * for inline and standalone constraints ({table}_{column}_key/_check), so the
+   * only reliable signal that a constraint is created by CREATE TABLE is that
+   * the table itself is being created here.
+   */
+  markInlineConstraintCreates(changes) {
+    const createTables = new Set(
+      changes
+        .filter(c => c.objectType === 'table' && c.changeType === 'CREATE')
+        .map(c => c.objectKey)
+    );
+
+    for (const change of changes) {
+      if (change.objectType !== 'constraint' || change.changeType !== 'CREATE') continue;
+      const conType = change.after?.constraintType || change.after?.type;
+      if (conType === 'FOREIGN_KEY' || conType === 'FOREIGN KEY') continue;
+
+      const table = change.after?.table || change.tableName || change.objectKey?.split('.').slice(0, 2).join('.');
+      const tableKey = table?.includes('.') ? table : (change.schema ? `${change.schema}.${table}` : table);
+      if (!tableKey || !createTables.has(tableKey)) continue;
+
+      if (!change.after) change.after = {};
+      change.after.isInline = true;
+      change.after.createdWithTable = true;
+      change.isInline = true;
+      change.createdWithTable = true;
+    }
   }
 
   buildSummary(changes) {

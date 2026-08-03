@@ -6,3 +6,4 @@ export { ExecutorWarningPrompt } from './executor-warning-prompt.js';
 export { CliWarningDisplay } from './cli-warning-display.js';
 export { DestructiveWarningIntegrator } from './planner-warning-integration.js';
 export { CloneDryRunner } from './clone-dry-runner.js';
+export { StaticDryRunValidator } from './static-dry-run-validator.js';

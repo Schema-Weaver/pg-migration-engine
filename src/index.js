@@ -45,6 +45,7 @@ export {
   ExecutorWarningPrompt,
   CliWarningDisplay,
   CloneDryRunner,
+  StaticDryRunValidator,
   DestructiveChangeClassifier,
   DataImpactAnalyzer,
   DataSampler,
@@ -197,6 +198,12 @@ export class SwMigrationEngine {
 
   /**
    * STEP 2: Diff two schema snapshots
+   *
+   * NOTE: This is the RAW diff. DROP changes are NOT expanded with reverse
+   * dependents from the live catalog here — migrate() (and the async
+   * diffExpanded()) perform that expansion, so use those when you need the
+   * full change set that would actually execute.
+   *
    * @param {import('./types/schema.js').SchemaSnapshot} desired - Target schema
    * @param {import('./types/schema.js').SchemaSnapshot} current - Current schema
    * @returns {import('./types/changes.js').SchemaDiff}
@@ -234,6 +241,50 @@ export class SwMigrationEngine {
 
     const introspector = new ReverseDependencyIntrospector(usePool);
     return introspector.expandDropChanges(changes, options);
+  }
+
+  /**
+   * STEP 2b: Diff two schema snapshots AND expand DROP changes with implicit
+   * reverse dependents from the live catalog (Layer 4). This is what migrate()
+   * runs internally; use it instead of diff() when you need the full change
+   * set that a real migration would execute (e.g. FK constraints referencing
+   * a dropped table are only discovered against the live database).
+   *
+   * The synchronous diff() stays raw so callers without a pool still work;
+   * it does NOT include implicit drops.
+   *
+   * @param {import('pg').Pool} [pool]
+   * @param {import('./types/schema.js').SchemaSnapshot} desired - Target schema
+   * @param {import('./types/schema.js').SchemaSnapshot} current - Current schema
+   * @param {Object} [options]
+   * @param {boolean} [options.expandDropDependencies=true] - Set false to keep
+   *   the raw (unexpanded) diff.
+   * @returns {Promise<import('./types/changes.js').SchemaDiff>}
+   */
+  async diffExpanded(pool, desired, current, options = {}) {
+    const usePool = pool || this.pool;
+    const diff = this.diff(desired, current);
+
+    if (diff.summary.totalChanges === 0) {
+      return diff;
+    }
+
+    if (usePool && options.expandDropDependencies !== false) {
+      const introspector = new ReverseDependencyIntrospector(usePool);
+      const expanded = await introspector.expandDropChanges(diff.changes, options);
+      if (expanded.additions.length > 0 || expanded.warnings.length > 0) {
+        diff.changes = expanded.changes;
+        diff.warnings = [...diff.warnings, ...expanded.warnings];
+        diff.summary.totalChanges = diff.changes.length;
+        diff.summary.drops = diff.changes.filter(c => c.changeType === 'DROP').length;
+        diff.dependencyExpansion = {
+          added: expanded.additions.length,
+          additions: expanded.additions.map(a => ({ objectType: a.objectType, objectKey: a.objectKey, implicitDependencyOf: a.implicitDependencyOf })),
+        };
+      }
+    }
+
+    return diff;
   }
 
   /**
@@ -296,7 +347,9 @@ export class SwMigrationEngine {
     const normalizedConnectionId = connectionId ? toUUID(connectionId) : null;
 
     const storage = new MigrationTable(usePool, normalizedConnectionId || connectionId);
-    await storage.ensureTable();
+    if (!options.dryRun) {
+      await storage.ensureTable();
+    }
 
     const introspector = new SchemaIntrospector(usePool);
     const executor = new MigrationExecutor(usePool, introspector, storage, {
@@ -376,18 +429,11 @@ export class SwMigrationEngine {
 
     const current = await this.introspect(usePool, options);
 
-    if (current.checksum === normalizedSchema.checksum) {
-      return {
-        success: true,
-        status: 'no_changes',
-        migrationId: null,
-        message: 'No schema changes detected.',
-        diff: { summary: { totalChanges: 0 }, changes: [] },
-        executedSteps: [],
-      };
-    }
-
-    const diff = this.diff(normalizedSchema, current);
+    // Note: the desired snapshot's checksum is NOT trusted here. It is usually
+    // copied from a cloned introspection and becomes stale the moment the user
+    // edits the desired schema, so an equal checksum must not silently skip real
+    // changes. The actual diff below is the source of truth for no_changes.
+    const diff = await this.diffExpanded(usePool, normalizedSchema, current, options);
 
     if (diff.summary.totalChanges === 0) {
       return {
@@ -398,24 +444,6 @@ export class SwMigrationEngine {
         diff,
         executedSteps: [],
       };
-    }
-
-    // Layer 4: expand DROP changes with reverse dependents from the live
-    // catalog (FKs pointing at dropped tables, views on dropped tables,
-    // indexes/constraints on dropped columns, domains on dropped types, ...)
-    if (usePool && options.expandDropDependencies !== false) {
-      const introspector = new ReverseDependencyIntrospector(usePool);
-      const expanded = await introspector.expandDropChanges(diff.changes, options);
-      if (expanded.additions.length > 0 || expanded.warnings.length > 0) {
-        diff.changes = expanded.changes;
-        diff.warnings = [...diff.warnings, ...expanded.warnings];
-        diff.summary.totalChanges = diff.changes.length;
-        diff.summary.drops = diff.changes.filter(c => c.changeType === 'DROP').length;
-        diff.dependencyExpansion = {
-          added: expanded.additions.length,
-          additions: expanded.additions.map(a => ({ objectType: a.objectType, objectKey: a.objectKey, implicitDependencyOf: a.implicitDependencyOf })),
-        };
-      }
     }
 
     const plan = this.plan(diff, options);
@@ -442,6 +470,7 @@ export class SwMigrationEngine {
       return {
         ...dryRunResult,
         status: 'dry_run',
+        dryRunStatus: dryRunResult.status,
         plan,
         diff,
       };

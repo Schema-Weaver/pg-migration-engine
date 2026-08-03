@@ -12,7 +12,7 @@ export class DestructiveChangeClassifier {
     const wildcard = this.wildcards[ct];
     if (wildcard) return wildcard(change);
     
-    if (ct === 'REMOVE_ENUM_VALUES' || ct === 'WIDENING_CAST' || ct === 'NARROWING_CAST') {
+    if (ct === 'REMOVE_ENUM_VALUES' || ct === 'NARROWING_CAST') {
       return { level: 'data_loss', reason: `${ct} operation may cause data loss`, requiresPreflightCheck: true };
     }
     
@@ -27,6 +27,7 @@ export class DestructiveChangeClassifier {
       COMMENT: () => ({ level: 'safe', reason: 'Comments have no data impact' }),
       GRANT: () => ({ level: 'safe', reason: 'Grants have no data impact' }),
       REVOKE: () => ({ level: 'safe', reason: 'Revokes have no data impact' }),
+      WIDENING_CAST: () => ({ level: 'safe', reason: 'Widening type cast preserves all data' }),
     };
 
     this.classifiers = {};
@@ -158,11 +159,6 @@ export class DestructiveChangeClassifier {
         details: info,
       };
     });
-    
-    this.addClassifier('WIDENING_CAST', () => ({
-      level: 'safe',
-      reason: 'Widening type cast preserves all data',
-    }));
   }
 
   addClassifier(key, fn) {

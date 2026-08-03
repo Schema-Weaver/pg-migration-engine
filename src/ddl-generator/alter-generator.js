@@ -403,7 +403,7 @@ function generateAlterColumnSql(change) {
       if (change.desiredValue === null || change.desiredValue === undefined) {
         return `ALTER TABLE ${table} ALTER COLUMN ${ident(col)} RESET STORAGE;`;
       }
-      return `ALTER TABLE ${table} ALTER COLUMN ${ident(col)} SET STORAGE ${change.desiredValue.toUpperCase()};`;
+      return `ALTER TABLE ${table} ALTER COLUMN ${ident(col)} SET STORAGE ${normalizeStorage(change.desiredValue)};`;
 
     case 'statistics':
     case 'statisticsTarget':
@@ -879,6 +879,20 @@ function ident(name) {
 function escapeString(str) {
   if (typeof str !== 'string') str = String(str);
   return str.replace(/'/g, "''");
+}
+
+/**
+ * Normalize a PostgreSQL column storage value to the full keyword PostgreSQL
+ * accepts in SET STORAGE. Introspection reports the internal pg_attribute
+ * letter code (p/m/e/x); desired schemas may use either the letter or the
+ * full word. Emitting the bare letter produces SQLSTATE 22023.
+ */
+function normalizeStorage(value) {
+  if (value === null || value === undefined) return null;
+  const raw = String(value).trim();
+  const STORAGE_WORDS = { p: 'PLAIN', m: 'MAIN', e: 'EXTERNAL', x: 'EXTENDED' };
+  const upper = raw.toUpperCase();
+  return STORAGE_WORDS[upper.toLowerCase()] || upper;
 }
 
 /**

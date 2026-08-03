@@ -260,7 +260,12 @@ export function translateSnapshot(raw) {
       owner: s.owner,
       tablespace: s.tablespace || undefined,
       comment: s.comment || undefined,
-      currentValue: s.current_value !== null ? s.current_value : undefined,
+      // pg_sequence_last_value returns NULL until the sequence is first read
+      // (is_called=false). A fresh sequence is effectively at its START value,
+      // so normalize NULL -> start_value. This keeps round-trip diffs stable:
+      // a desired snapshot carrying currentValue equal to startValue must not
+      // produce a perpetual phantom ALTER ... RESTART WITH.
+      currentValue: s.current_value !== null ? s.current_value : (s.start_value !== null ? s.start_value : undefined),
     };
     sequenceMap[key] = seqObj;
     if (schemaMap[s.schema]) {

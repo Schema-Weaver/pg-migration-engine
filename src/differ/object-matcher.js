@@ -14,6 +14,12 @@ import { InputValidationError } from '../errors.js';
  */
 
 const RENAME_SIMILARITY_THRESHOLD = 0.60;
+// Columns get a lower name bar: a candidate column already had to share the
+// same parent table AND be type-compatible (checked before this gate), so the
+// name check is only a coarse filter. Bug 5: old_col -> new_col scores 0.571
+// (< 0.60) and was never even considered, silently degrading to a destructive
+// DROP + CREATE. Erring toward RENAME for columns preserves data.
+const COLUMN_RENAME_SIMILARITY_THRESHOLD = 0.50;
 const HIGH_CONFIDENCE_THRESHOLD = 0.80;
 const MEDIUM_CONFIDENCE_THRESHOLD = 0.70;
 const LOW_CONFIDENCE_THRESHOLD = 0.60;
@@ -157,7 +163,14 @@ export class ObjectMatcher {
           current: currentMap[key],
         });
       } else {
-        // Only in desired - potential CREATE or rename target
+        // Only in desired - potential CREATE or rename target.
+        // Skip dangling child declarations: an index/constraint whose parent
+        // table is absent from the desired tables section (e.g. cloned
+        // snapshots that keep swt_multi_drop_pkey after the table is
+        // deleted). Such objects cannot be created (their table is gone and
+        // the DROP cascades them away) and must not be re-created.
+        if (this.isDanglingChildReference(objectType, desiredMap[key], desired)) continue;
+
         result.creates.push({
           key,
           objectType,
@@ -176,6 +189,35 @@ export class ObjectMatcher {
         if (objectType === 'sequence' && currentMap[key]?.ownedBy) {
           continue;
         }
+
+        // Skip drops of indexes that back a UNIQUE/PRIMARY KEY constraint.
+        // PostgreSQL auto-creates the backing index from the constraint and
+        // forbids dropping that index independently (SQLSTATE 2BP01) - it is
+        // only removed through its constraint (ALTER TABLE DROP CONSTRAINT) or
+        // its table (DROP TABLE ... CASCADE). An introspected snapshot always
+        // contains the backing index even when the desired snapshot only
+        // declares the constraint (default name {table}_{col}_key/_pkey), and
+        // when both the constraint and its table are dropped the CASCADE
+        // handles it. A standalone DROP INDEX is therefore never valid here.
+        if (objectType === 'index') {
+          const obj = currentMap[key];
+          const schema = obj?.schema || key.split('.')[0];
+          const indexName = obj?.name || key.split('.').pop();
+          const constraintMaps = [desired?.constraints, current?.constraints].filter(Boolean);
+          const backsConstraint = constraintMaps.some(constraints =>
+            Object.entries(constraints).some(([ck, con]) =>
+              con &&
+              (con.name === indexName || ck.endsWith(`.${indexName}`)) &&
+              (con.schema || ck.split('.')[0]) === schema &&
+              (con.constraintType === 'UNIQUE' || con.constraintType === 'PRIMARY_KEY' ||
+               con.constraintType === 'PRIMARY KEY' || con.type === 'unique' || con.type === 'primary_key')
+            )
+          );
+          if (obj?.isUnique && backsConstraint) {
+            continue;
+          }
+        }
+
         result.drops.push({
           key,
           objectType,
@@ -240,6 +282,74 @@ export class ObjectMatcher {
     }
 
     result.renames = detectedRenames;
+
+    // Carry dependent child objects across detected table renames so a table
+    // rename never degrades into DROP+CREATE pairs of its constraints/indexes.
+    this.carryChildrenAcrossTableRenames(result);
+  }
+
+  /**
+   * Carry dependent child objects across a detected table rename.
+   *
+   * Child identity embeds the parent table name: constraints are keyed
+   * schema.table.name, indexes/triggers/policies carry a `table` reference. A
+   * table rename re-keys those children, so without this the matcher sees each
+   * unchanged child as an unrelated DROP + CREATE pair, which the generators
+   * render as a DROP CONSTRAINT/INDEX on the OLD table name (42P01 after the
+   * RENAME has already run) plus a comment-only CREATE (the renamed table would
+   * silently lose its PK). PostgreSQL preserves constraints, indexes, data and
+   * sequence ownership on ALTER TABLE ... RENAME, so a child whose name is
+   * unchanged across the parent rename needs no step of its own. The pair is
+   * re-matched instead so the property differ can still surface genuine changes.
+   */
+  carryChildrenAcrossTableRenames(result) {
+    const tableRenames = (result.renames || []).filter(r => r.objectType === 'table');
+    if (tableRenames.length === 0) return;
+
+    const oldToNew = new Map();
+    for (const r of tableRenames) {
+      const oldKey = r.oldKey || r.key;
+      const newKey = r.newKey;
+      if (!oldKey || !newKey) continue;
+      oldToNew.set(oldKey, newKey);
+    }
+    if (oldToNew.size === 0) return;
+
+    const lastSegment = (key) => String(key).split('.').pop();
+    const oldSegToNewKey = new Map();
+    for (const [oldKey, newKey] of oldToNew) oldSegToNewKey.set(lastSegment(oldKey), newKey);
+
+    const childTypes = new Set(['constraint', 'index', 'trigger', 'policy', 'rule']);
+    const carriedKeys = new Set();
+
+    for (const drop of result.drops) {
+      if (!childTypes.has(drop.objectType)) continue;
+      const parentSeg = drop.parent ? lastSegment(drop.parent) : null;
+      if (!parentSeg || !oldSegToNewKey.has(parentSeg)) continue;
+      const newTableKey = oldSegToNewKey.get(parentSeg);
+      const newParentSeg = lastSegment(newTableKey);
+      if (carriedKeys.has(drop.key)) continue;
+
+      for (let i = 0; i < result.creates.length; i++) {
+        const create = result.creates[i];
+        if (create.objectType !== drop.objectType) continue;
+        if (carriedKeys.has(create.key)) continue;
+        const createParentSeg = create.parent ? lastSegment(create.parent) : null;
+        if (createParentSeg !== newParentSeg) continue;
+        if (create.name !== drop.name) continue;
+
+        result.matches.push({
+          key: create.key,
+          objectType: create.objectType,
+          desired: create.object,
+          current: drop.object,
+        });
+        result.creates.splice(i, 1);
+        result.drops.splice(result.drops.indexOf(drop), 1);
+        carriedKeys.add(create.key).add(drop.key);
+        break;
+      }
+    }
   }
 
   /**
@@ -272,8 +382,11 @@ export class ObjectMatcher {
         if (dropParent !== createParent) return false;
       }
 
-      // Name similarity must be above threshold
-      if (!isSimilarEnough(drop.name, create.name, RENAME_SIMILARITY_THRESHOLD)) return false;
+      // Name similarity must be above threshold (columns: lower bar, see const)
+      const nameThreshold = drop.objectType === 'column'
+        ? COLUMN_RENAME_SIMILARITY_THRESHOLD
+        : RENAME_SIMILARITY_THRESHOLD;
+      if (!isSimilarEnough(drop.name, create.name, nameThreshold)) return false;
 
       // Type compatibility check (for columns and types)
       if (!this.typesCompatible(drop, create, desired, current)) return false;
@@ -283,6 +396,17 @@ export class ObjectMatcher {
       if (drop.objectType === 'index' && drop.object && create.object) {
         const structScore = this.computeStructuralSimilarity(drop.object, create.object);
         if (structScore < 0.50) return false;
+      }
+
+      // Structural compatibility check for tables: a rename preserves the
+      // object's columns, so the column sets must meaningfully overlap.
+      // Bug 10: "swt_multi_drop" ([id]) -> "swt_multi_new" ([id, val]) shares
+      // a name prefix but is a different table - inferring a rename silently
+      // drops the desired 'val' column. Gate renames on column-set overlap so
+      // a real drop+create is NOT collapsed into a lossy rename.
+      if (drop.objectType === 'table' && drop.object && create.object) {
+        const structScore = this.computeStructuralSimilarity(drop.object, create.object);
+        if (structScore < 0.60) return false;
       }
 
       return true;
@@ -576,6 +700,27 @@ export class ObjectMatcher {
     if (obj.table) return obj.table;
 
     return null;
+  }
+
+  /**
+   * True when a desired-side index/constraint points at a parent table that is
+   * absent from the desired tables section. Cloned snapshots keep the dropped
+   * table's children after the table itself is deleted; those declarations are
+   * dangling (cannot be created — 42P01) and the table DROP cascades them away.
+   */
+  isDanglingChildReference(objectType, obj, desired) {
+    if (objectType !== 'index' && objectType !== 'constraint') return false;
+    if (!obj || !desired || !desired.tables) return false;
+
+    const tableRef = obj.table;
+    if (!tableRef) return false;
+
+    const candidates = [tableRef];
+    if (obj.schema && obj.tableName) {
+      candidates.push(`${obj.schema}.${obj.tableName}`);
+    }
+
+    return !candidates.some(t => desired.tables[t]);
   }
 
   /**

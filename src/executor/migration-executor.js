@@ -427,6 +427,10 @@ export class MigrationExecutor {
 
       this.pgVersion = await detectPgVersion(this.pool);
 
+      if (mergedConfig.dryRun) {
+        return this._executeStaticDryRun(plan, mergedConfig, result, startTime);
+      }
+
       await this.preflightCheck(plan, mergedConfig);
 
       if (mergedConfig.autoReconcile !== false) {
@@ -567,7 +571,7 @@ export class MigrationExecutor {
       
       let recoveryInfo = null;
       try {
-        recoveryInfo = await this.handleFailure(error, plan);
+        recoveryInfo = await this.handleFailure(error, plan, mergedConfig);
       } catch (recoveryError) {
         console.error('[CRITICAL] handleFailure() error:', recoveryError.message);
         await this.lockManager.release().catch(() => {});
@@ -612,6 +616,70 @@ export class MigrationExecutor {
       this.snapshots = { before: null, after: null };
       this._nonTxQueue.clear();
     }
+  }
+
+  /**
+   * Static dry-run: validate the plan WITHOUT touching the database. No DDL is
+   * executed, no advisory lock is taken, no migration record is written and no
+   * bookkeeping tables are created. Returns a report of what WOULD run.
+   */
+  async _executeStaticDryRun(plan, mergedConfig, result, startTime) {
+    const { StaticDryRunValidator } = await import('../warnings/static-dry-run-validator.js');
+    const validator = new StaticDryRunValidator(plan, mergedConfig);
+    const report = validator.validate();
+
+    const versionNum = this.pgVersion ? parseFloat(this.pgVersion) * 10000 : null;
+    const steps = (plan.steps || []).map(step => {
+      const gate = step.pgVersionMinimum || step.pgVersionMin;
+      if (versionNum !== null && gate && versionNum < gate * 10000) {
+        return { ...step, dryRunError: `requires PostgreSQL ${gate}+ but the server is ${this.pgVersion}` };
+      }
+      return step;
+    });
+
+    const allErrors = [...report.errors];
+    for (const step of steps) {
+      if (step.dryRunError) {
+        allErrors.push({ code: 'PG_VERSION', message: step.dryRunError, step: step.id });
+      }
+    }
+    const valid = allErrors.length === 0;
+
+    this.executedSteps = steps.map(step => ({
+      ...step,
+      stepId: step.id,
+      status: 'dry_run',
+      error: step.dryRunError || null,
+    }));
+
+    result.stepsCompleted = valid ? steps.length : 0;
+    result.stepsFailed = allErrors.length;
+    result.warnings = report.warnings;
+    result.errors = allErrors.map(e => ({ step: e.step, message: e.message, code: e.code }));
+    result.status = valid ? MIGRATION_STATUS.DRY_RUN_SUCCESS : MIGRATION_STATUS.DRY_RUN_FAILURE;
+    result.success = valid;
+
+    this.emitProgress({
+      type: 'dry_run_complete',
+      valid,
+      stepsTotal: steps.length,
+      warnings: report.warnings.length,
+      errors: allErrors.length,
+    });
+
+    this.state = 'completed';
+
+    const built = this.buildResult(plan, result.status.toLowerCase(), startTime, result);
+    built.message = valid
+      ? `Dry run succeeded: ${steps.length} statement(s) would execute. No changes were applied to the database.`
+      : `Dry run failed validation (${allErrors.length} error(s)). Nothing was applied to the database.`;
+    built.dryRunReport = {
+      valid,
+      stepCount: steps.length,
+      errors: allErrors.map(e => ({ step: e.step, message: e.message, code: e.code })),
+      warnings: report.warnings,
+    };
+    return built;
   }
 
   /**
@@ -1153,6 +1221,7 @@ export class MigrationExecutor {
 
           this.executedSteps.push({
             stepId: step.id,
+            changeId: step.changeId,
             sql: step.sql,
             phase: phaseNum,
             status: 'failed',
@@ -1429,6 +1498,7 @@ export class MigrationExecutor {
 
       this.executedSteps.push({
         stepId: step.id,
+        changeId: step.changeId,
         sql: step.sql,
         phase: phaseNum,
         status: 'completed',
@@ -1650,6 +1720,7 @@ export class MigrationExecutor {
     if (statements.length === 0) {
       this.executedSteps.push({
         stepId: step.id,
+        changeId: step.changeId,
         sql: step.sql,
         phase: phaseNum,
         phaseName,
@@ -1700,6 +1771,30 @@ export class MigrationExecutor {
       rowsAffected: subResults.reduce((sum, r) => sum + r.rowsAffected, 0),
       subStatements: statements.length,
     });
+
+    const totalDuration = subResults.reduce((sum, r) => sum + r.duration, 0);
+    const totalRows = subResults.reduce((sum, r) => sum + r.rowsAffected, 0);
+    this.executedSteps.push({
+      stepId: step.id,
+      changeId: step.changeId,
+      sql: step.sql,
+      phase: phaseNum,
+      phaseName,
+      status: 'completed',
+      duration: totalDuration,
+      rowsAffected: totalRows,
+      timestamp: new Date().toISOString(),
+      isTransactional: step.isTransactional !== false,
+    });
+
+    if (this.migrationRecord?.id) {
+      await this.storage.updateStepProgress(
+        this.migrationRecord.id,
+        step.id,
+        'completed',
+        totalDuration
+      ).catch(() => {});
+    }
   }
 
   async _executeSingleStatement(client, sql, step, phaseNum, phaseName, isSubStatement = false) {
@@ -1710,6 +1805,7 @@ export class MigrationExecutor {
     if (!isSubStatement) {
       this.executedSteps.push({
         stepId: step.id,
+        changeId: step.changeId,
         sql: step.sql,
         phase: phaseNum,
         phaseName,
@@ -2403,9 +2499,10 @@ async preflightCheck(plan, config) {
    * Handle execution failure
    * @param {Error} error
    * @param {import('../types/migration.js').MigrationPlan} plan
+   * @param {Object} [config]
    * @returns {Promise<Object>}
    */
-  async handleFailure(error, plan) {
+  async handleFailure(error, plan, config = {}) {
     const executedPhaseNames = [...new Set(
       this.executedSteps.filter(s => s.status === 'completed').map(s => this.getPhaseName(s.phase))
     )];
@@ -2456,6 +2553,27 @@ async preflightCheck(plan, config) {
       }
     }
 
+    // Best-effort cross-phase rollback: undo the DDL that already committed in
+    // earlier phases so a failed migration never leaves partial-phase objects
+    // behind. Skipped for connection errors (state is ambiguous and handled by
+    // crash recovery) and dry-runs (nothing was committed).
+    let autoRollback = null;
+    if (!this.isConnectionError(error) && !config.dryRun) {
+      const transactional = rollbackSQL.filter(
+        s => s.isTransactional !== false && !s.sql.trim().startsWith('--')
+      );
+      if (transactional.length > 0) {
+        autoRollback = await this.executeRollbackSQL(transactional);
+        this.emitProgress({
+          type: 'cross_phase_rollback',
+          state: autoRollback.state,
+          stepsApplied: autoRollback.steps.length,
+          errors: autoRollback.errors.length,
+          message: `Auto-rolled back ${autoRollback.steps.length} committed phase step(s) after migration failure`,
+        });
+      }
+    }
+
     if (this.migrationRecord?.id) {
       await this.storage.failRecord(
         this.migrationRecord.id,
@@ -2478,7 +2596,80 @@ async preflightCheck(plan, config) {
       manualRecoveryRequired: nonTransactionalExecuted.length > 0,
       recoverySQL,
       rollbackSQL,
+      autoRollback,
       connectionRecovery,
+    };
+  }
+
+  /**
+   * Execute best-effort rollback SQL (reverse change order) for the DDL that
+   * already committed in earlier phases of a failed migration. Runs in a single
+   * transaction with per-statement savepoints so one failing undo statement
+   * does not abort the remaining rollback. Non-transactional steps (e.g.
+   * CONCURRENTLY) are never executed here — they are reported for manual
+   * recovery instead.
+   * @param {Array<{changeId: string, changeType: string, objectKey: string, sql: string}>} steps
+   * @returns {Promise<{state: string, steps: Array, errors: Array}>}
+   */
+  async executeRollbackSQL(steps) {
+    const client = await this.pool.connect();
+    const applied = [];
+    const errors = [];
+    try {
+      await client.query('BEGIN');
+      for (let i = 0; i < steps.length; i++) {
+        const s = steps[i];
+        const savepointName = `rbsp_${i}`;
+        try {
+          await client.query(`SAVEPOINT ${savepointName}`);
+          const result = await client.query(s.sql);
+          await client.query(`RELEASE SAVEPOINT ${savepointName}`);
+          applied.push({
+            changeId: s.changeId,
+            changeType: s.changeType,
+            objectKey: s.objectKey,
+            sql: s.sql,
+            status: 'applied',
+            rowsAffected: result.rowCount,
+          });
+        } catch (statementError) {
+          try {
+            await client.query(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+            await client.query(`RELEASE SAVEPOINT ${savepointName}`);
+          } catch (spError) {
+            console.error('[CRITICAL] Rollback savepoint restore failed:', spError.message);
+          }
+          const pgError = extractPgError(statementError);
+          errors.push({
+            changeId: s.changeId,
+            changeType: s.changeType,
+            objectKey: s.objectKey,
+            sql: s.sql,
+            status: 'failed',
+            error: statementError.message,
+            code: pgError.code,
+          });
+        }
+      }
+      await client.query('COMMIT');
+    } catch (txError) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('[CRITICAL] Rollback transaction ROLLBACK failed:', rollbackError.message);
+      }
+      return {
+        state: 'rollback_transaction_failed',
+        steps: applied,
+        errors: [...errors, { status: 'failed', error: txError.message }],
+      };
+    } finally {
+      client.release();
+    }
+    return {
+      state: errors.length === 0 ? 'rolled_back' : 'partial_rollback',
+      steps: applied,
+      errors,
     };
   }
 

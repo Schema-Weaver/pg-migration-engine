@@ -809,8 +809,13 @@ function generateCreateConstraintSql(con) {
   let sql = '';
   switch (constraintType) {
     case 'PRIMARY KEY':
-    case 'PRIMARY_KEY':
-      return `-- Primary key ${con.name} created inline during CREATE TABLE`;
+    case 'PRIMARY_KEY': {
+      if (con.createdWithTable || con.isInline || con.generatedInTable) {
+        return `-- Primary key ${con.name} created inline during CREATE TABLE`;
+      }
+      sql = `ALTER TABLE ${table} ADD CONSTRAINT ${ident(con.name)} PRIMARY KEY (${(con.columns || []).map(ident).join(', ')})${deferClause}${enforceClause};`;
+      break;
+    }
       
     case 'FOREIGN KEY':
     case 'FOREIGN_KEY': {
@@ -826,7 +831,7 @@ function generateCreateConstraintSql(con) {
     }
 
     case 'UNIQUE':
-      if (con.createdWithTable || con.isInline || con.generatedInTable || (con.name && con.name.endsWith('_key'))) {
+      if (con.createdWithTable || con.isInline || con.generatedInTable) {
         return `-- Unique constraint ${con.name} created inline during CREATE TABLE`;
       }
       const nullsNotDistinct = con.nullsNotDistinct !== undefined && con.nullsNotDistinct !== null && con.nullsNotDistinct ? ' NULLS NOT DISTINCT' : '';
@@ -834,7 +839,7 @@ function generateCreateConstraintSql(con) {
       break;
       
     case 'CHECK': {
-      if (con.createdWithTable || con.isInline || con.generatedInTable || (con.name && con.name.endsWith('_check'))) {
+      if (con.createdWithTable || con.isInline || con.generatedInTable) {
         return `-- Check constraint ${con.name} created inline during CREATE TABLE`;
       }
       const validatedExpr = validateCheckExpression(
@@ -861,7 +866,13 @@ function generateCreateConstraintSql(con) {
 
 function generateCreateSequenceSql(seq) {
   let sql = `CREATE SEQUENCE ${ident(seq.schema)}.${ident(seq.name)}`;
-  
+
+  // PostgreSQL defaults CREATE SEQUENCE to bigint; a desired snapshot that
+  // declares dataType ('smallint'/'integer'/'bigint') must be honoured, or the
+  // round-trip diff will report a perpetual dataType mismatch. AS <type> is a
+  // type keyword, not an identifier — never quote it.
+  if (seq.dataType) sql += ` AS ${seq.dataType}`;
+
   const increment = seq.increment;
   const minValue = seq.minimumValue ?? seq.minValue;
   const maxValue = seq.maximumValue ?? seq.maxValue;

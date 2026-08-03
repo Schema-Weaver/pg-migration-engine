@@ -76,9 +76,35 @@ export class DdlGenerator {
       if (sql && !sql.startsWith('--')) {
         statements.push(`-- ${changeType} ${objectType} ${change.objectKey}`);
         statements.push(sql);
+      } else if (sql) {
+        // plan() caches change.sql as the generator's full comment-prefixed
+        // output ("-- DROP table public.x\nDROP TABLE ..."). Strip the leading
+        // comment lines and emit the real SQL so generateDDL() after plan()
+        // does not silently return empty (Bug 1).
+        const body = stripLeadingComments(sql);
+        if (body) {
+          statements.push(`-- ${changeType} ${objectType} ${change.objectKey}`);
+          statements.push(body);
+        }
       }
     }
 
     return statements.join('\n');
   }
+}
+
+function stripLeadingComments(sql) {
+  if (!sql) return '';
+  const lines = String(sql).split('\n');
+  let started = false;
+  const kept = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!started) {
+      if (trimmed === '' || trimmed.startsWith('--')) continue;
+      started = true;
+    }
+    kept.push(line);
+  }
+  return kept.join('\n').trim();
 }

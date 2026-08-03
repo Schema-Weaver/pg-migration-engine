@@ -443,12 +443,27 @@ export class DependencyResolver {
     if (type === 'extension') return 3;
     if ((type === 'type' || type === 'domain') && changeType === 'CREATE') return 4;
     if (type === 'schema') return 5;
-    if (type === 'sequence') return 5;
+    if (type === 'sequence') {
+      // CREATE at 5 (before the table at 6 so DEFAULT nextval(...) resolves).
+      // OWNED BY must wait for the owning table AND column: CREATE table = 6,
+      // ADD COLUMN = 7, but a table inferred as a RENAME lands at 10, so run
+      // ownedBy at 11 (after data-migration boundary guarantees the table).
+      // Other ALTERs (RESTART, INCREMENT, ...) keep the historical phase 5.
+      if (changeType === 'CREATE') return 5;
+      if (change.property === 'ownedBy') return 11;
+      return 5;
+    }
     if (type === 'table' && changeType === 'CREATE') return 6;
     if (type === 'index' && changeType === 'CREATE' && !change.isConcurrent) return 9;
     if (type === 'constraint' && change.constraintType !== 'FOREIGN_KEY') return 10;
     if (change.property === 'dataType' && change.castRequired) return 11;
-    if (type === 'constraint' && change.constraintType === 'FOREIGN_KEY') return 12;
+    if (type === 'constraint' && change.constraintType === 'FOREIGN_KEY') {
+      // DROP ordering: an FK constraint depends on the referenced index/unique
+      // constraint, so it must be dropped BEFORE non-FK constraint drops
+      // (phase 10), index drops, and table drops (phase 24). Create/alter keep
+      // the historical phase 12 (after the tables exist).
+      return change.changeType === 'DROP' ? 9 : 12;
+    }
     if (change.property === 'isValidated' && change.changeType.includes('VALIDATE')) return 13;
     if (type === 'view') return 14;
     if (type === 'materializedView') return 15;
